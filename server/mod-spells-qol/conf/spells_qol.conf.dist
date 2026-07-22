@@ -1,0 +1,29 @@
+[worldserver]
+
+#
+#    SpellsQoL.UnifyClassTrainers.Enable
+#        Description: Every class trainer shows the full spell list of
+#                     the best trainer for that class.
+#        Default:     1
+#
+
+SpellsQoL.UnifyClassTrainers.Enable = 1
+
+#
+#    SpellsQoL.UnifyRidingTrainers.Enable
+#        Description: Every riding trainer shows the full riding spell list
+#                     merged from all mount trainers.
+#        Default:     1
+#
+
+SpellsQoL.UnifyRidingTrainers.Enable = 1
+
+#
+#    SpellsQoL.RidingTrainer.IgnoreReputation
+#        Description: Riding trainers are always interactable for training,
+#                     regardless of city faction reputation. Mount vendors
+#                     still use normal reputation rules.
+#        Default:     1
+#
+
+SpellsQoL.RidingTrainer.IgnoreReputation = 1

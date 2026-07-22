@@ -1,0 +1,50 @@
+#
+# mod-skyriding configuration
+#
+
+# Enable skyriding while on a flying mount with flight charges (98052).
+Skyriding.Enable = 1
+
+# Separate vigor pool for Surge Forward / Skyward Ascent (not flight takeoff charges).
+Skyriding.VigorMax = 6
+
+# Testing recharge (raise later for live).
+Skyriding.VigorRechargeMs = 500
+
+# Mouse/keyboard yaw multiplier while airborne (0.75 = -25%).
+Skyriding.TurnRate = 0.75
+
+# 0 = block Space/X ascend/descend (skyriding). 1 = classic WotLK vertical.
+Skyriding.ClassicVertical = 0
+
+# Flight speed rates (MOVE_FLIGHT multipliers). Live-like: open @ 250%, peak 6.5, stall < 1.0.
+Skyriding.BaseFlightRate = 2.5
+Skyriding.MaxFlightRate = 6.5
+Skyriding.MinFlightRate = 0.25
+Skyriding.StallThreshold = 1.0
+
+# Pitch thresholds (radians). Strength scales with |pitch| (curvature).
+Skyriding.DivePitch = -0.12
+Skyriding.ClimbPitch = 0.12
+Skyriding.DiveAccelPerSec = 0.55
+Skyriding.HorizDecelPerSec = 0.35
+Skyriding.ClimbDecelPerSec = 0.95
+
+# S while flying = brake (extra decel). Never hover-stop.
+Skyriding.BrakeDecelPerSec = 1.8
+
+# Client-side stall sink (yards/sec) when rate < StallThreshold.
+Skyriding.StallSinkPerSec = 8.0
+
+# Debug SPD overlay cadence (ms). ~400 = 2.5 Hz.
+Skyriding.SpdIntervalMs = 400
+
+# Surge Forward: speed burst only (no KnockbackFrom — that zeroed pitch). Mild lift = WXL.
+Skyriding.SurgeSpeedXY = 28.0
+Skyriding.SurgeSpeedZ = 1.0
+Skyriding.SurgeBoostRate = 1.5
+
+# Skyward Ascent: same ground and air — vertical knockback (jumpZ) + FlapUp→SecondFlapUp.
+Skyriding.SkywardSpeedXY = 0.05
+Skyriding.SkywardSpeedZ = 42.0
+Skyriding.SkywardBoostRate = 2.0

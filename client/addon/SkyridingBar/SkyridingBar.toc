@@ -1,0 +1,8 @@
+﻿## Interface: 30300
+## Title: SkyridingBar
+## Notes: Horizon skyriding vigor bar, speed/pitch debug, and WXL bridge messages.
+## Author: Horizon / vibe-coded
+## Version: 0.1
+## OptionalDeps: WarcraftXL
+
+SkyridingBar.lua
