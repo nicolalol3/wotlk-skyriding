@@ -1,65 +1,65 @@
 # WotLK Skyriding
 
-Port sperimentale dello **skyriding** (dragonriding-style) su World of Warcraft **3.3.5a / WotLK**, basato su AzerothCore + WarcraftXL (WXL) lato client.
+Experimental **skyriding** (dragonriding-style flight) for World of Warcraft **3.3.5a / WotLK**, built on AzerothCore + WarcraftXL (WXL) on the client.
 
-Questo progetto è **vibe-coddato**. Non lo pubblico per vantarmi, ma perché sia **open source** e perché qualcuno di davvero capace di coddare riesca a **finirlo**.
-
----
-
-## Cosa c'è in questa repo
-
-| Path | Contenuto |
-|------|-----------|
-| `client/wxl-scripts/wxl-skyriding/` | Modulo WXL: fisiche client, animazioni AdvFly, bridge Lua |
-| `client/wxl-scripts/wxl-anim-limit/` | Modulo WXL: alza il tetto anim ID oltre 505 (necessario per AdvFly / mount drag-and-drop in patch) |
-| `server/mod-skyriding/` | Modulo AzerothCore skyriding (fisiche server, vigor, Surge/Skyward, messaggi addon) |
-| `server/mod-spells-qol/` | Modulo QoL **già presente** sul mio server personale, incluso per completezza (vedi sotto) |
-| `client/dbc/Spell.dbc` | Il mio `Spell.dbc` da **patch-b** (contiene anche roba custom non legata allo skyriding) |
-| `client/addon/SkyridingBar/` | Solo i pezzi UI che mostrano vigor / velocità / pitch e parlano con WXL — **non** l'addon intera |
-
-**Non incluso:** asset della mount (M2/skin/texture/.anim). Va estratta a parte con wow.export (io uso **Tawny Wind Rider**).
+This project is **vibe-coded**. I am not publishing it to show off — I am publishing it so it can be **open source**, and so someone who actually knows how to code can **finish it**.
 
 ---
 
-## Architettura (in breve)
+## What is in this repo
 
-1. **WXL (WarcraftXL)** — obbligatorio. Il sistema estende le animazioni e il comportamento del client; **senza WXL non gira**.
-2. **Moduli WXL** da droppare/abilitare nei scripts WXL:
-   - `wxl-anim-limit` — permette anim ID ≥ 506 (AdvFly) senza processi strani di backporting.
-   - `wxl-skyriding` — companion client dello skyriding.
-3. **Moduli server AzerothCore**:
-   - `mod-skyriding` — **necessario**.
-   - `mod-spells-qol` — lo infilo anche se «non c'entra niente» con lo skyriding in sé: sul mio server personale c'era già, e **non so** se lavorandoci sopra ho reso lo skyriding dipendente da pezzi di quel modulo. Per completezza lo includo intero. La parte chiaramente collegata è `ridingchanges.cpp` (aura flight charges **98052**), che `mod-skyriding` usa come prerequisito per attivarsi sulla mount volante. Il resto del modulo è QoL personale non documentata qui.
+| Path | Contents |
+|------|----------|
+| `client/wxl-scripts/wxl-skyriding/` | WXL module: client physics, AdvFly animations, Lua bridge |
+| `client/wxl-scripts/wxl-anim-limit/` | WXL module: raises the anim ID ceiling past 505 (needed for AdvFly / drag-and-drop mount assets in a patch) |
+| `server/mod-skyriding/` | AzerothCore skyriding module (server physics, vigor, Surge/Skyward, addon messages) |
+| `server/mod-spells-qol/src/ridingchanges.cpp` | Single extracted file from my pre-existing riding QoL module (see below) |
+| `client/dbc/Spell.dbc` | My `Spell.dbc` from **patch-b** (also contains unrelated custom content) |
+| `client/addon/SkyridingBar/` | Only the UI pieces that show vigor / speed / pitch and talk to WXL — **not** the full addon |
+
+**Not included:** mount assets (M2/skin/texture/.anim). Export those yourself with wow.export (I use **Tawny Wind Rider**).
+
+---
+
+## Architecture (short)
+
+1. **WXL (WarcraftXL)** — required. The system extends client animations and behavior; **it will not run without WXL**.
+2. **WXL script modules** to drop into / enable under your WXL scripts folder:
+   - `wxl-anim-limit` — allows animation IDs ≥ 506 (AdvFly) without weird backporting workflows.
+   - `wxl-skyriding` — client companion for skyriding.
+3. **AzerothCore server modules**:
+   - `mod-skyriding` — **required**.
+   - `ridingchanges.cpp` — this file lived inside my personal `mod-spells-qol` on my own server. I am including **only this file** (not the rest of that module) because skyriding was integrated on top of that riding work, and **I am not sure** whether skyriding now depends on it. The clear link is the flight-charges aura **98052**, which `mod-skyriding` checks before activating on a flying mount. This file is **not** a drop-in complete module by itself — you must wire it into your own server module / build the same way I did on Horizon.
 4. **Client DBC / patch**:
-   - Montare le due spell con ID **98100** (Surge Forward) e **98101** (Skyward Ascent) dal `Spell.dbc` in questa repo.
-   - Quel `Spell.dbc` contiene **anche altra roba custom del mio progetto Horizon** che alla gente **non serve** — usatelo solo per quelle spell (o estraetele) a vostro rischio.
-   - Mettere in patch una **mount** con le sequenze AdvFly (io: Tawny Wind Rider da wow.export). Con `wxl-anim-limit` + AnimationData esteso in patch potete drag-and-drop la mount senza backporting inventato.
-5. **Addon** — droppare `client/addon/SkyridingBar/` in `Interface/AddOns`. Serve a UI vigor / debug velocità-pitch e a inoltrare i messaggi `HORIZON_SKY` verso WXL.
+   - Ship the two spells with IDs **98100** (Surge Forward) and **98101** (Skyward Ascent) from the `Spell.dbc` in this repo.
+   - That `Spell.dbc` also contains **other custom Horizon content that nobody else needs** — use it only for those spells (or extract them) at your own risk.
+   - Put a **mount** with AdvFly sequences into your patch (I use Tawny Wind Rider from wow.export). With `wxl-anim-limit` plus an extended AnimationData in patch, you can drag-and-drop that mount without inventing a backport pipeline.
+5. **Addon** — drop `client/addon/SkyridingBar/` into `Interface/AddOns`. It handles the vigor UI / speed-pitch debug and forwards `HORIZON_SKY` messages to WXL.
 
 ---
 
-## Spell ID
+## Spell IDs
 
-| ID | Nome (uso) |
-|----|------------|
+| ID | Name (role) |
+|----|-------------|
 | **98100** | Surge Forward |
 | **98101** | Skyward Ascent |
 
-Fonte: `server/mod-skyriding` + `client/dbc/Spell.dbc` (patch-b).
+Source: `server/mod-skyriding` + `client/dbc/Spell.dbc` (patch-b).
 
 ---
 
 ## Known issues
 
-- Manca la **terza spell** che fa lo swirl completo — ancora da implementare.
-- Alcuni **piccoli bug di animazioni** (spesso causati dallo spam continuo delle spell, che comunque **non** dovrebbe essere possibile su un server normale perché avrebbero cooldown).
-- **Bug più grande** (per me impossibile da fixare al momento): quando si atterra da un volo, passare alla **ground mode** della mount in modo flawless. Ora ci sono flickering d'animazioni e strani tempi d'attesa.
-- **Altro bug grande**: non riesco a far sì che la spell di ascesa (**Skyward**) mantenga il momento buildato al punto del cast. Attualmente decelerà la mount e la fa salire di ~40 yard con animazione coerente, ma perde lo «slancio».
-- Va **rimosso il rallentamento della mount con X**: l'ho implementato per sbaglio credendo esistesse su live — **non esiste**.
-- (Non esattamente un bug) L'accelerazione / decelerazione rispetto al **pitch** è impossibile da estrarre correttamente da retail perché Blizzard ha negato a Lua di controllare il pitch. La curva giusta va raggiunta col **testing nel tempo**.
+- The **third spell** (full swirl) is missing — still not implemented.
+- Some **small animation bugs** (often from spamming the spells continuously, which should **not** be possible on a normal server because they would have cooldowns).
+- **Biggest bug** (currently unfixable for me): landing from flight and switching to the mount **ground mode** flawlessly. Right now there is animation flickering and weird wait times.
+- **Another big bug**: I cannot make the ascent spell (**Skyward**) keep the momentum built up at the moment of cast. Currently it decelerates the mount and lifts ~40 yards with a coherent animation, but it loses the built speed.
+- The **X slowdown** on the mount should be **removed**: I implemented it by mistake thinking live had it — **it does not**.
+- (Not exactly a bug) Pitch-based acceleration / deceleration cannot be scraped correctly from retail WoW because Blizzard blocked Lua from reading pitch. The right curve has to be found through **playtesting over time**.
 
 ---
 
 ## Disclaimer
 
-Codice grezzo, personale, incompleto. Se lo forkate e lo finite, fate un favore a chi vuole skyriding su 3.3.5a. Non c'è supporto ufficiale; usate a vostro rischio.
+Rough, personal, incomplete code. If you fork it and finish it, you will help everyone who wants skyriding on 3.3.5a. No official support; use at your own risk.
