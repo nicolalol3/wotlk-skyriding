@@ -19,12 +19,12 @@ Skyriding.DiveAccelPerSec = 0.55
 Skyriding.HorizDecelPerSec = 0.35
 Skyriding.ClimbDecelPerSec = 0.95
 Skyriding.BrakeDecelPerSec = 1.8
-Skyriding.StallSinkPerSec = 7.0
+Skyriding.StallSinkPerSec = 9.45
 Skyriding.SpdIntervalMs = 400
 Skyriding.SurgeBoostRate = 1.5
 Skyriding.SkywardSpeedZ = 42.0
 Skyriding.SkywardBoostRate = 2.0
-Skyriding.SkywardLandGraceMs = 700
+Skyriding.SkywardLandGraceMs = 3500
 
 # After land: forced ground mode (ms). No fly re-entry; walking off a cliff = fall.
 Skyriding.GroundLockMs = 2000

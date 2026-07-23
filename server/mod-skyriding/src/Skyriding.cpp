@@ -46,12 +46,12 @@ namespace
     float sHorizDecelPerSec = 0.35f;
     float sClimbDecelPerSec = 0.95f;
     float sBrakeDecelPerSec = 1.8f;
-    float sStallSinkPerSec = 7.0f;
+    float sStallSinkPerSec = 9.45f; // was 7.0; +35% stall descend
     float sSkywardSpeedZ = 42.0f;   // knockback jumpZ (ground takeoff + air climb)
     float sSurgeBoostRate = 1.5f;
     float sSkywardBoostRate = 2.0f; // air Skyward: add to flightRate after knockback
     uint32 sSpdIntervalMs = 400;
-    uint32 sSkywardLandGraceMs = 700; // client takeoff grace mirror
+    uint32 sSkywardLandGraceMs = 3500; // cover knockback + full flap (smash false-stall)
     uint32 sGroundLockMs = 2000;      // after land: no fly re-entry (cliff = fall)
 
 
@@ -90,12 +90,12 @@ namespace
         sHorizDecelPerSec = sConfigMgr->GetOption<float>("Skyriding.HorizDecelPerSec", 0.35f);
         sClimbDecelPerSec = sConfigMgr->GetOption<float>("Skyriding.ClimbDecelPerSec", 0.95f);
         sBrakeDecelPerSec = sConfigMgr->GetOption<float>("Skyriding.BrakeDecelPerSec", 1.8f);
-        sStallSinkPerSec = sConfigMgr->GetOption<float>("Skyriding.StallSinkPerSec", 7.0f);
+        sStallSinkPerSec = sConfigMgr->GetOption<float>("Skyriding.StallSinkPerSec", 9.45f);
         sSkywardSpeedZ = sConfigMgr->GetOption<float>("Skyriding.SkywardSpeedZ", 42.0f);
         sSurgeBoostRate = sConfigMgr->GetOption<float>("Skyriding.SurgeBoostRate", 1.5f);
         sSkywardBoostRate = sConfigMgr->GetOption<float>("Skyriding.SkywardBoostRate", 2.0f);
         sSpdIntervalMs = sConfigMgr->GetOption<uint32>("Skyriding.SpdIntervalMs", 400);
-        sSkywardLandGraceMs = sConfigMgr->GetOption<uint32>("Skyriding.SkywardLandGraceMs", 700);
+        sSkywardLandGraceMs = sConfigMgr->GetOption<uint32>("Skyriding.SkywardLandGraceMs", 3500);
         sGroundLockMs = sConfigMgr->GetOption<uint32>("Skyriding.GroundLockMs", 2000);
     }
 
@@ -362,23 +362,20 @@ namespace
         player->KnockbackFrom(x, y, 0.01f, speedZ);
     }
 
-    // Air Skyward: knockback with current flight speed as XY so coast is not wiped.
+    // Air Skyward: world-vertical climb only. XY along facing caused sideways
+    // shove when turning / pitch ≠ path. Coast lives in flightRate (kept across
+    // knockback FLY flicker) — do not bake a facing-aligned XY into the packet.
     void ImpulseSkywardAir(Player* player, float speedZ)
     {
-        float const o = player->GetOrientation();
-        float speedXY = player->GetSpeed(MOVE_FLIGHT);
-        if (speedXY < 7.0f)
-            speedXY = 7.0f;
-        float const bx = player->GetPositionX() - std::cos(o);
-        float const by = player->GetPositionY() - std::sin(o);
-        player->KnockbackFrom(bx, by, speedXY, speedZ);
+        ImpulseUp(player, speedZ);
     }
 
     void HandleSkyridingAbility(Player* player, uint32 spellId)
     {
         // Candidate = mounted flying mount with charges.
         // Surge requires already airborne.
-        // Skyward ground = vertical knockback takeoff; air = knockback with XY=flight speed.
+        // Skyward ground = vertical knockback takeoff; air = same vertical climb
+        // (facing-aligned XY shove was sideways while turning).
         if (!IsSkyridingCandidate(player))
             return;
         SkyridingState& st = GetState(player);
@@ -401,20 +398,21 @@ namespace
             bool const airborne = player->IsFlying();
             SendAddon(player, "ANIM\t1");
 
+            // Arm grace before knockback so the FLY flicker never wipes rate / GLOCK.
+            st.landGraceUntilMs = getMSTime() + sSkywardLandGraceMs;
             if (airborne)
             {
-                ImpulseSkywardAir(player, sSkywardSpeedZ);
+                // Boost first so ImpulseSkywardAir XY uses the new flight speed.
                 st.flightRate = std::min(sMaxFlightRate, st.flightRate + sSkywardBoostRate);
                 player->SetSpeed(MOVE_FLIGHT, st.flightRate, true);
+                ImpulseSkywardAir(player, sSkywardSpeedZ);
             }
             else
             {
-                ImpulseUp(player, sSkywardSpeedZ);
                 st.flightRate = std::max(st.flightRate, sBaseFlightRate);
                 player->SetSpeed(MOVE_FLIGHT, st.flightRate, true);
+                ImpulseUp(player, sSkywardSpeedZ);
             }
-            // Client owns land; this only mirrors takeoff grace timing for docs/compat.
-            st.landGraceUntilMs = getMSTime() + sSkywardLandGraceMs;
         }
 
         SyncRate(player, st);
@@ -509,23 +507,24 @@ public:
             }
         }
 
+        bool const inLandGrace = getMSTime() < st.landGraceUntilMs;
+
         if (candidate && flying && !groundLocked)
         {
-            if (!st.wasFlying)
-                st.flightRate = sBaseFlightRate;
-
+            // Never reset flightRate on FLY rising edge — that wiped Skyward
+            // momentum when knockback ended (even after boost mid-climb).
             TickMomentum(player, st, diff);
         }
         else if (st.wasFlying && !flying)
         {
             ApplyTurnRate(player, false);
-            st.flightRate = sBaseFlightRate;
             st.braking = false;
-            // Solid land only — not mid-dive / knockback FALLING (false GLOCK zeroed pitch).
+            // Knockback / cliff keep rate. Solid ground only → base + GLOCK.
             bool const falling = player->HasUnitMovementFlag(
                 MOVEMENTFLAG_FALLING | MOVEMENTFLAG_FALLING_FAR);
-            if (!falling && getMSTime() >= st.landGraceUntilMs)
+            if (!falling && !inLandGrace)
             {
+                st.flightRate = sBaseFlightRate;
                 ArmGroundLock(player, st);
                 ApplyGroundLockFlags(player);
             }
@@ -561,6 +560,9 @@ public:
         {
             SkyridingState& st = GetState(player);
             if (!IsSkyridingCandidate(player) || InGroundLock(st))
+                return;
+            // Skyward knockback apex looks settled — ignore false smash during grace.
+            if (getMSTime() < st.landGraceUntilMs)
                 return;
             if (!player->IsFlying())
                 return;

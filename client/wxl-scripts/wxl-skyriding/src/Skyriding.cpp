@@ -59,6 +59,8 @@ namespace
     constexpr DWORD kSurgeLiftMs = 400;
     constexpr float kSkywardLiftPerSec = 22.0f;
     constexpr DWORD kSkywardLiftMs = 550;
+    // Mirror server StallSinkPerSec (7.0 + 35%). Client owns Z — UpdatePosition is stomped.
+    constexpr float kStallSinkPerSec = 9.45f;
     constexpr float kMinCoastYardsPerSec = 2.0f; // never integrate at 0
     constexpr float kBaseFlightYards = 7.0f;     // WotLK MOVE_FLIGHT base
 
@@ -153,7 +155,7 @@ namespace
     constexpr float kSoftLandMaxMz = 0.55f;
     constexpr int kSettleFrames = 2;
     constexpr DWORD kSmashConfirmMs = 400;
-    constexpr DWORD kTakeoffGraceMs = 750;
+    constexpr DWORD kTakeoffGraceMs = 3500; // cover full Skyward flap (~2.8s) + knockback apex
     constexpr DWORD kGroundLockMs = 2000;
     constexpr DWORD kSmashCooldownMs = 800;
     constexpr DWORD kRecentFlyMs = 1500;
@@ -527,6 +529,24 @@ namespace
         g_liftUntilMs = GetTickCount() + durationMs;
     }
 
+    // Rate stall / smash: SlowFall anim + gentle Z drop (server RATE drives g_stalled).
+    // Never sink during Skyward/Surge window — knockback apex ≠ stall.
+    void ApplyStallSink(void* unit, float dt)
+    {
+        if (!unit || !g_stalled || dt <= 0.f)
+            return;
+        if (!UnitIsFlying(unit))
+            return;
+        // Knockback apex / flap window — grace covers full Skyward chain.
+        if (GetTickCount() < g_takeoffGraceUntilMs)
+            return;
+
+        float* pos = UnitPos(unit);
+        float const from[3] = { pos[0], pos[1], pos[2] };
+        pos[2] -= kStallSinkPerSec * dt;
+        ClampMoveAgainstWorld(from, pos);
+    }
+
     void ApplyTurnInertia(void* unit)
     {
         if (!unit || !UnitIsFlying(unit) || g_turnRate >= 0.999f)
@@ -814,6 +834,12 @@ namespace
             g_smashArmStartMs = 0;
             return false;
         }
+        // Skyward/Surge flap: apex can look "settled" — never smash mid-ability.
+        if (PhaseIsLocked())
+        {
+            g_smashArmStartMs = 0;
+            return false;
+        }
 
         float const pitch = Pitch(unit);
         if (pitch < PITCH_DIVE_ENTER || pitch > 0.55f)
@@ -1062,10 +1088,12 @@ namespace
         bool const recentFly = (g_lastFlyingMs != 0)
             && (nowTick - g_lastFlyingMs) < kRecentFlyMs;
 
-        // Pad grace only for fresh takeoff — not after a real flight (log: grace blocked land 750ms).
+        // Pad grace only for fresh takeoff — not after a real flight.
+        // Do not cancel an active Skyward/Surge flap window (air knockback).
         if (g_airborneSinceMs != 0
             && (nowTick - g_airborneSinceMs) > kTakeoffGraceMs
-            && g_takeoffGraceUntilMs != 0)
+            && g_takeoffGraceUntilMs != 0
+            && !PhaseIsLocked())
         {
             g_takeoffGraceUntilMs = 0;
         }
@@ -1076,8 +1104,10 @@ namespace
             ArmTakeoffGrace();
 
         // Vanilla land: FLY- edge, or soft impact (FLY already gone, still settling).
+        // Skip during takeoff grace / Skyward flaps (air knockback FLY flicker).
         if (!flyingNow && !InGroundLock()
             && GetTickCount() >= g_takeoffGraceUntilMs
+            && !PhaseIsLocked()
             && (g_prevFlying || recentFly))
         {
             bool const settled = SampleSettle(unit);
@@ -1108,6 +1138,7 @@ namespace
         }
         else if (flyingNow && recentFall && SoftLandZQuiet()
             && GetTickCount() >= g_takeoffGraceUntilMs
+            && !PhaseIsLocked()
             && g_airborneSinceMs != 0
             && (nowTick - g_airborneSinceMs) < 200)
         {
@@ -1152,6 +1183,7 @@ namespace
                 ApplyCoastAndBrake(unit, dt);
                 ApplyTurnInertia(unit);
                 ApplyAbilityLift(unit, dt);
+                ApplyStallSink(unit, dt);
             }
             else
                 ApplyAbilityLift(unit, dt);
@@ -1165,18 +1197,26 @@ namespace
             return;
         }
 
+        // FLY re-entry after knockback must not steal Skyward into Dive.
         if (flyingNow && !g_prevFlying && !PhaseIsLocked()
+            && GetTickCount() >= g_takeoffGraceUntilMs
             && (fallingNow || recentFall || Pitch(unit) < PITCH_DIVE_ENTER))
             BeginDive(unit, model);
 
         if (flyingNow)
             TickFsm(unit, model);
-        else if (fallingNow && PhaseIsLocked())
-            TickFsm(unit, model);
-        else if (fallingNow && recentFall && !PhaseIsLocked())
+        else if (fallingNow)
         {
-            BeginDive(unit, model);
-            TickFsm(unit, model);
+            // Skyward/Surge knockback: keep flap FSM. Never auto-Dive mid-ability.
+            if (PhaseIsLocked() || GetTickCount() < g_takeoffGraceUntilMs)
+                TickFsm(unit, model);
+            else if (recentFall)
+            {
+                BeginDive(unit, model);
+                TickFsm(unit, model);
+            }
+            else
+                ReleaseAnimDriver();
         }
         else
             ReleaseAnimDriver();
@@ -1348,6 +1388,23 @@ namespace
         return 0;
     }
 
+    void InterruptForAbility()
+    {
+        // Dive / prior flap / surge must yield to Surge/Skyward instantly.
+        g_inDive = false;
+        g_phase = AnimPhase::Idle;
+        g_phaseUntilMs = 0;
+        g_forcedAnimId = -1;
+        g_boneAnimId = -1;
+        g_boneAnimSpeed = 0.0f;
+        g_skywardPitchLocked = false;
+        g_liftPitchLocked = false;
+        g_liftUntilMs = 0;
+        g_liftPerSec = 0.f;
+        g_settleFrames = 0;
+        g_smashArmStartMs = 0;
+    }
+
     int __cdecl LuaSkyridingFlap(void* state)
     {
         if (InGroundLock())
@@ -1355,31 +1412,33 @@ namespace
 
         const int kind = (wlua::GetTop(state) >= 1 && wlua::IsNumber(state, 1))
             ? static_cast<int>(wlua::ToNumber(state, 1)) : 0;
-        if (PhaseIsLocked())
-            return 0;
 
         void* unit = ActivePlayer();
         void* model = AnimationModel(unit);
         if (!unit || !model)
             return 0;
 
-        g_boneAnimId = -1; // force SetBoneSequence
-        g_boneAnimSpeed = 0.0f;
-        g_inDive = false;
-        g_stalled = false; // Surge/Skyward recover from stall/smash
-        g_settleFrames = 0;
-        g_smashArmStartMs = 0;
+        // Ability always wins over dive / locked phases (mid-dive Skyward was a no-op).
+        InterruptForAbility();
+        g_stalled = false;
+
         if (kind == 1)
         {
-            // Skyward: FlapUp → SecondFlapUp. Pad grace only from ground takeoff.
-            if (!UnitIsFlying(unit))
-                ArmTakeoffGrace();
-            g_skywardPitchLock = Pitch(unit);
+            // Skyward: FlapUp → SecondFlapUp. Grace always — air knockback
+            // clears FLY briefly and soft-land / auto-dive must not claim it.
+            ArmTakeoffGrace();
+            g_airborneSinceMs = GetTickCount();
+            // Don't lock nose-down dive pitch — that re-enters Dive after flap.
+            float lockPitch = Pitch(unit);
+            if (lockPitch < PITCH_DIVE_EXIT)
+                lockPitch = 0.0f;
+            g_skywardPitchLock = lockPitch;
             g_skywardPitchLocked = true;
-            g_liftPitchLock = Pitch(unit);
+            g_liftPitchLock = lockPitch;
             g_liftPitchLocked = true;
             g_liftPerSec = 0.f;
             g_liftUntilMs = GetTickCount() + kSkywardLiftMs;
+            Pitch(unit) = lockPitch;
             BeginSkywardFlap1(unit, model);
         }
         else
