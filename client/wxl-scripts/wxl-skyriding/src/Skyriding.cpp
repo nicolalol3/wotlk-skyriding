@@ -3,6 +3,8 @@
 //
 // Anim ownership: SetBoneSequence on transitions + ResolveModelAnimationId override
 // (via wxl-anim-limit) so the client cannot stomp AdvFly with Fly/Run/Fall every frame.
+// Land / smash: react to vanilla fly-mount signals (FLY- on dirt, XY stuck on geometry).
+// Do NOT invent world TraceLine land/wall ownership.
 
 #include "common/Log.hpp"
 #include "core/Hook.hpp"
@@ -17,6 +19,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 
 namespace
@@ -50,15 +53,16 @@ namespace
     constexpr uint32_t MOVE_FLAG_DESCENDING = 0x00800000;
     constexpr uint32_t MOVE_FLAG_FLYING = 0x02000000;
 
-    // Stall sink (yards/sec). DESCENDING also forced so engine physics participates.
-    constexpr float kStallSinkPerSec = 8.0f;
-    constexpr float kMinCoastYardsPerSec = 2.0f; // never integrate at 0
-    constexpr float kBaseFlightYards = 7.0f;     // WotLK MOVE_FLIGHT base
-    // Surge: brief Z lift without writing pitch (knockback was zeroing pitch to 0).
+    // Ability Z lift without KnockbackFrom (preserves pitch + XY coast).
+    // Surge: small hop. Skyward air: stronger climb (ground Skyward still uses server knockback).
     constexpr float kSurgeLiftPerSec = 6.0f;
     constexpr DWORD kSurgeLiftMs = 400;
+    constexpr float kSkywardLiftPerSec = 22.0f;
+    constexpr DWORD kSkywardLiftMs = 550;
+    constexpr float kMinCoastYardsPerSec = 2.0f; // never integrate at 0
+    constexpr float kBaseFlightYards = 7.0f;     // WotLK MOVE_FLIGHT base
 
-    // Knockback / surge / stall still need a ray clamp (engine may skip walls).
+    // Knockback / ability lifts still need a ray clamp (engine may skip walls).
     // Coast must NOT write UnitPos — that tunnels through WMOs. Keep FORWARD via
     // CGInputControl::SetControlBit so the client moves with native collision.
     constexpr uintptr_t kTraceLine = 0x007A3B70;
@@ -124,12 +128,35 @@ namespace
     float g_lastFacing = 0.f;
     bool g_haveLastFacing = false;
     DWORD g_lastPhysicsMs = 0;
-    float g_lastCollidePos[3] = {};
-    bool g_haveLastCollidePos = false;
-    bool g_forcedForwardBit = false; // we Set the FORWARD control bit for coast
-    DWORD g_holdGroundUntilMs = 0;   // after LAND: refuse AdvFly even if FLYING flickers back
-    bool g_prevFlying = false;       // rising edge → fall-into-fly dive
-    DWORD g_lastFallingMs = 0;       // FLYING often clears FALLING the same frame — remember it
+    DWORD g_takeoffGraceUntilMs = 0; // after Skyward / knockback — ignore FLY- on pad
+    DWORD g_groundLockUntilMs = 0;   // after vanilla land: forced ground mode
+    DWORD g_smashCooldownUntilMs = 0;
+    DWORD g_smashArmStartMs = 0;     // settled+fly: wait before smash (land wins)
+    bool g_smashMsgPending = false;  // addon → server WALL (stall)
+    bool g_landMsgPending = false;   // addon → server LAND (GLOCK sync)
+    bool g_forcedForwardBit = false;
+    bool g_prevFlying = false;
+    bool g_prevFalling = false;
+    DWORD g_lastFallingMs = 0;
+    DWORD g_lastFlyingMs = 0;
+    DWORD g_airborneSinceMs = 0; // FLY rising edge — pad grace only for fresh takeoff
+    float g_lastPos[3] = {};
+    bool g_haveLastPos = false;
+    int g_settleFrames = 0;
+    float g_lastMoveXY = 0.f;
+    float g_lastMoveZ = 0.f;
+
+    // Soft land: FLY gone + FALLING, Z already stopped (slide XY is OK). Cliff keeps big mz.
+    constexpr float kSettleYardsXY = 0.12f;
+    constexpr float kSettleYardsZ = 0.16f;
+    // Post-impact fall still has mz ~0.25–0.45 (log E); 0.20 was too tight.
+    constexpr float kSoftLandMaxMz = 0.55f;
+    constexpr int kSettleFrames = 2;
+    constexpr DWORD kSmashConfirmMs = 400;
+    constexpr DWORD kTakeoffGraceMs = 750;
+    constexpr DWORD kGroundLockMs = 2000;
+    constexpr DWORD kSmashCooldownMs = 800;
+    constexpr DWORD kRecentFlyMs = 1500;
 
     enum class AnimPhase : uint8_t
     {
@@ -150,13 +177,15 @@ namespace
     float g_boneAnimSpeed = 1.0f;
     int g_cruiseTier = ANIM_FORWARD_GLIDE; // 1532 / 1722 / 1704 with hysteresis
     bool g_inDive = false;
-    DWORD g_surgeLiftUntilMs = 0;
-    float g_surgePitchLock = 0.f;
-    bool g_surgePitchLocked = false;
+    DWORD g_liftUntilMs = 0;
+    float g_liftPerSec = 0.f;
+    float g_liftPitchLock = 0.f;
+    bool g_liftPitchLocked = false;
     float g_skywardPitchLock = 0.f;
     bool g_skywardPitchLocked = false;
     void* g_forceUnit = nullptr;
     void* g_forceModel = nullptr;
+
 
     bool ModuleDisabled()
     {
@@ -291,20 +320,8 @@ namespace
         const uint32_t before = flags;
         const bool wasFlying = (before & MOVE_FLAG_FLYING) != 0;
 
-        // Always block Space ascent / X descend (except stall DESC).
-        uint32_t after = before & ~MOVE_FLAG_ASCENDING;
-
-        if (g_stalled && wasFlying)
-        {
-            // Stall: wings can't hold — let DESCENDING drive engine sink (X is still "blocked"
-            // as a player verb; here DESC is our physics, not the X key).
-            after |= MOVE_FLAG_DESCENDING;
-        }
-        else
-        {
-            // Normal skyriding: no X / classic descend.
-            after &= ~MOVE_FLAG_DESCENDING;
-        }
+        // Always block Space ascent / X descend (X is a pure no-op).
+        uint32_t after = before & ~(MOVE_FLAG_ASCENDING | MOVE_FLAG_DESCENDING);
 
         // Block Space takeoff from solid ground only.
         // Fall-into-fly: Space sets ASC+FLY while FALLING — must KEEP FLYING (only strip ASC).
@@ -379,28 +396,10 @@ namespace
         return true;
     }
 
-    void ApplyWorldCollision(void* unit)
+    void ApplyWorldCollision(void* /*unit*/)
     {
-        if (!unit || !UnitIsFlying(unit))
-        {
-            g_haveLastCollidePos = false;
-            return;
-        }
-
-        float* pos = UnitPos(unit);
-        if (g_haveLastCollidePos)
-        {
-            float desired[3] = { pos[0], pos[1], pos[2] };
-            ClampMoveAgainstWorld(g_lastCollidePos, desired);
-            pos[0] = desired[0];
-            pos[1] = desired[1];
-            pos[2] = desired[2];
-        }
-
-        g_lastCollidePos[0] = pos[0];
-        g_lastCollidePos[1] = pos[1];
-        g_lastCollidePos[2] = pos[2];
-        g_haveLastCollidePos = true;
+        // Removed from cruise path: clamping Z away from terrain prevented real landings.
+        // Ability lifts still use ClampMoveAgainstWorld on their own step.
     }
 
     // Keep / clear the same control bit MoveForwardStart/Stop uses (0x10).
@@ -439,6 +438,7 @@ namespace
     // Never hover. Coast = keep FORWARD control bit so the engine moves (with walls).
     // Do not write UnitPos — that is what tunneled through geometry.
     // Only force the bit when W is NOT held; otherwise the client owns it.
+    // While stalled (smash / rate stall): do not force coast — let precipitate play.
     void ApplyCoastAndBrake(void* unit, float /*dt*/)
     {
         if (!g_mode || !unit || !UnitIsFlying(unit))
@@ -453,6 +453,13 @@ namespace
             || (GetAsyncKeyState(VK_DOWN) & 0x8000) != 0;
         bool const flagBack = (flags & MOVE_FLAG_BACKWARD) != 0;
         g_braking = keyBack || flagBack;
+
+        if (g_stalled)
+        {
+            ReleaseForcedForward();
+            flags &= ~(MOVE_FLAG_BACKWARD | MOVE_FLAG_PENDING_STOP);
+            return;
+        }
 
         bool const wHeld = (GetAsyncKeyState('W') & 0x8000) != 0
             || (GetAsyncKeyState(VK_UP) & 0x8000) != 0;
@@ -477,45 +484,47 @@ namespace
         }
     }
 
-    // Stall = sink without changing mount pitch (DESCENDING + explicit Z).
-    void ApplyStallSink(void* unit, float dt)
+    // Ability lift: raise Z without KnockbackFrom (holds pitch lock).
+    void ApplyAbilityLift(void* unit, float dt)
     {
-        if (!g_mode || !unit || dt <= 0.f || !UnitIsFlying(unit) || !g_stalled)
-            return;
-
-        float* pos = UnitPos(unit);
-        float const from[3] = { pos[0], pos[1], pos[2] };
-        pos[2] -= kStallSinkPerSec * dt;
-        ClampMoveAgainstWorld(from, pos);
-
-        MovementFlags(unit) |= MOVE_FLAG_DESCENDING;
-    }
-
-    // Surge lift: raise a bit without ever writing pitch (holds lock if something tries).
-    void ApplySurgeLift(void* unit, float dt)
-    {
-        if (!unit || dt <= 0.f || !UnitIsFlying(unit))
+        if (!unit || dt <= 0.f)
             return;
 
         const DWORD now = GetTickCount();
-        if (g_surgePitchLocked)
-            Pitch(unit) = g_surgePitchLock;
+        if (g_liftPitchLocked)
+            Pitch(unit) = g_liftPitchLock;
 
-        if (g_surgeLiftUntilMs == 0 || now >= g_surgeLiftUntilMs)
+        if (g_liftUntilMs == 0 || now >= g_liftUntilMs)
         {
-            if (now >= g_surgeLiftUntilMs)
+            if (now >= g_liftUntilMs)
             {
-                g_surgeLiftUntilMs = 0;
-                g_surgePitchLocked = false;
+                g_liftUntilMs = 0;
+                g_liftPitchLocked = false;
+                g_liftPerSec = 0.f;
             }
             return;
         }
 
+        // Ground Skyward uses server knockback (FALLING); still lock pitch.
+        // Air Surge/Skyward: lift while flying.
+        if (!UnitIsFlying(unit) && !UnitIsFalling(unit))
+            return;
+
         float* pos = UnitPos(unit);
         float const from[3] = { pos[0], pos[1], pos[2] };
-        pos[2] += kSurgeLiftPerSec * dt;
+        pos[2] += g_liftPerSec * dt;
         ClampMoveAgainstWorld(from, pos);
-        Pitch(unit) = g_surgePitchLock;
+        Pitch(unit) = g_liftPitchLock;
+    }
+
+    void StartAbilityLift(void* unit, float liftPerSec, DWORD durationMs)
+    {
+        if (!unit)
+            return;
+        g_liftPitchLock = Pitch(unit);
+        g_liftPitchLocked = true;
+        g_liftPerSec = liftPerSec;
+        g_liftUntilMs = GetTickCount() + durationMs;
     }
 
     void ApplyTurnInertia(void* unit)
@@ -626,29 +635,225 @@ namespace
         g_inDive = false;
         g_phaseUntilMs = 0;
         g_skywardPitchLocked = false;
-        g_surgePitchLocked = false;
-        g_surgeLiftUntilMs = 0;
+        g_liftPitchLocked = false;
+        g_liftUntilMs = 0;
+        g_liftPerSec = 0.f;
         g_forceUnit = nullptr;
         g_forceModel = nullptr;
     }
 
-    // Server LAND (GetMapHeight touchdown) — ignore phase/spell/FLYING leftovers.
-    void ForceGroundFromServer()
+    // AdvFly Glide/Dive keeps looping on bones after ReleaseAnimDriver — looks like
+    // "wings open / fake precipitate" on soft land (log: land_accept anim=1530/1532).
+    void ForceGroundMountPose(void* unit)
+    {
+        void* model = AnimationModel(unit);
+        if (!unit || !model || !g_setBoneSeq)
+            return;
+        constexpr int kMountStand = 0;
+        g_setBoneSeq(unit, reinterpret_cast<uintptr_t>(model), -1, kMountStand,
+            0.0f, 0, 1.0f, 0, 1, 0);
+        ReleaseAnimDriver();
+        Pitch(unit) = 0.f;
+    }
+
+    void ArmTakeoffGrace()
+    {
+        g_takeoffGraceUntilMs = GetTickCount() + kTakeoffGraceMs;
+    }
+
+    void ArmGroundLock(DWORD ms = kGroundLockMs)
+    {
+        DWORD const until = GetTickCount() + ms;
+        if (until > g_groundLockUntilMs)
+            g_groundLockUntilMs = until;
+    }
+
+    bool InGroundLock()
+    {
+        return g_groundLockUntilMs != 0 && GetTickCount() < g_groundLockUntilMs;
+    }
+
+    // Forced ground mount mode: may FALL off cliffs, must NOT re-enter FLYING.
+    // Soft land (quiet Z): also clear FALLING — keeping it plays vanilla "precipitate"
+    // for the whole GLOCK window (log: OnVanillaLand soft + fall=1 until glock_expire).
+    void ApplyGroundLock(void* unit, bool clearFalling)
     {
         ReleaseForcedForward();
         ReleaseAnimDriver();
-        void* unit = ActivePlayer();
+        if (!unit)
+            return;
+        uint32_t& flags = MovementFlags(unit);
+        flags &= ~(MOVE_FLAG_FLYING | MOVE_FLAG_DISABLE_GRAV
+            | MOVE_FLAG_ASCENDING | MOVE_FLAG_DESCENDING);
+        if (clearFalling)
+            flags &= ~(MOVE_FLAG_FALLING | MOVE_FLAG_FALLING_FAR);
+    }
+
+    void ApplyGroundLock(void* unit)
+    {
+        ApplyGroundLock(unit, false);
+    }
+
+    void KillAbilityState()
+    {
+        g_liftUntilMs = 0;
+        g_liftPerSec = 0.f;
+        g_liftPitchLocked = false;
+        g_skywardPitchLocked = false;
+        g_inDive = false;
+        g_haveLastFacing = false;
+        g_lastPhysicsMs = 0;
+        g_haveLastPos = false;
+        g_settleFrames = 0;
+        g_smashArmStartMs = 0;
+    }
+
+
+    // Sample frame delta; updates settle streak (XY+Z almost still = on a surface).
+    bool SampleSettle(void* unit)
+    {
+        if (!unit)
+            return false;
+        float* pos = UnitPos(unit);
+        float moveXY = 999.f;
+        float moveZ = 999.f;
+        if (g_haveLastPos)
+        {
+            float const mx = pos[0] - g_lastPos[0];
+            float const my = pos[1] - g_lastPos[1];
+            moveXY = sqrtf(mx * mx + my * my);
+            moveZ = fabsf(pos[2] - g_lastPos[2]);
+        }
+        g_lastMoveXY = (moveXY > 90.f) ? -1.f : moveXY;
+        g_lastMoveZ = (moveZ > 90.f) ? -1.f : moveZ;
+        g_lastPos[0] = pos[0];
+        g_lastPos[1] = pos[1];
+        g_lastPos[2] = pos[2];
+        g_haveLastPos = true;
+
+        if (moveXY < kSettleYardsXY && moveZ < kSettleYardsZ)
+            ++g_settleFrames;
+        else
+            g_settleFrames = 0;
+
+        return g_settleFrames >= kSettleFrames;
+    }
+
+    // Soft impact: Z quiet while !FLY+FALLING — XY slide must not block ground mode.
+    bool SoftLandZQuiet()
+    {
+        return g_haveLastPos && g_lastMoveZ >= 0.f && g_lastMoveZ < kSoftLandMaxMz;
+    }
+
+    // Vanilla land: engine cleared FLYING on walkable ground (or soft impact settled).
+    void OnVanillaLand(void* unit)
+    {
+        KillAbilityState();
+        ReleaseForcedForward();
+        g_stalled = false;
+        g_coastYardsPerSec = kMinCoastYardsPerSec;
+        g_landMsgPending = true;
+        g_smashMsgPending = false;
+        g_takeoffGraceUntilMs = 0;
+        g_airborneSinceMs = 0;
+        ArmGroundLock(kGroundLockMs);
         if (unit)
         {
-            MovementFlags(unit) &= ~(MOVE_FLAG_FLYING | MOVE_FLAG_DISABLE_GRAV
-                | MOVE_FLAG_ASCENDING | MOVE_FLAG_DESCENDING
-                | MOVE_FLAG_FALLING | MOVE_FLAG_FALLING_FAR);
+            // Soft impact still has FALLING — clear it or vanilla Fall plays ~GLOCK (2s).
+            ApplyGroundLock(unit, true);
+            // Snap bones off stuck AdvFly Glide/Dive pose on soft land.
+            ForceGroundMountPose(unit);
         }
-        g_haveLastFacing = false;
-        g_haveLastCollidePos = false;
-        g_lastPhysicsMs = 0;
-        // Hold ground briefly so a late client fly flag cannot restart AdvFly.
-        g_holdGroundUntilMs = GetTickCount() + 450;
+        else
+            ReleaseAnimDriver();
+    }
+
+    // Vanilla smash: still airborne after settle window → stall (land did not claim FLY-).
+    void OnVanillaSmash(void* unit)
+    {
+        KillAbilityState();
+        ReleaseForcedForward();
+        g_stalled = true;
+        g_coastYardsPerSec = kMinCoastYardsPerSec;
+        g_smashMsgPending = true;
+        g_smashCooldownUntilMs = GetTickCount() + kSmashCooldownMs;
+        g_cruiseTier = ANIM_SLOW_FALL;
+
+        if (unit)
+        {
+            void* model = AnimationModel(unit);
+            if (model)
+            {
+                g_boneAnimId = -1;
+                PlayBoneAnim(unit, model, ANIM_SLOW_FALL, 1.0f, 0.0f, false, true);
+                EnterPhase(AnimPhase::Cruise, 0);
+                g_forcedAnimId = ANIM_SLOW_FALL;
+                g_forceUnit = unit;
+                g_forceModel = model;
+            }
+        }
+    }
+
+    // Settled while FLYING: wait — dirt usually drops FLY first; wall keeps FLY → smash.
+    bool TryVanillaSmash(void* unit)
+    {
+        if (!unit || !UnitIsFlying(unit) || g_stalled)
+        {
+            g_smashArmStartMs = 0;
+            return false;
+        }
+        if (InGroundLock())
+        {
+            g_smashArmStartMs = 0;
+            return false;
+        }
+        if (GetTickCount() < g_smashCooldownUntilMs)
+            return false;
+        if (GetTickCount() < g_takeoffGraceUntilMs)
+        {
+            g_smashArmStartMs = 0;
+            return false;
+        }
+
+        float const pitch = Pitch(unit);
+        if (pitch < PITCH_DIVE_ENTER || pitch > 0.55f)
+        {
+            g_smashArmStartMs = 0;
+            SampleSettle(unit);
+            return false;
+        }
+
+        bool const pressing = (MovementFlags(unit) & MOVE_FLAG_FORWARD) != 0
+            || g_forcedForwardBit
+            || (GetAsyncKeyState('W') & 0x8000) != 0
+            || (GetAsyncKeyState(VK_UP) & 0x8000) != 0;
+        bool const settled = SampleSettle(unit);
+        if (!pressing || !settled)
+        {
+            g_smashArmStartMs = 0;
+            return false;
+        }
+
+        DWORD const now = GetTickCount();
+        if (g_smashArmStartMs == 0)
+        {
+            g_smashArmStartMs = now;
+            ReleaseForcedForward(); // stop fighting the surface while we wait
+            return false;
+        }
+        if (now - g_smashArmStartMs < kSmashConfirmMs)
+            return false;
+
+        g_smashArmStartMs = 0;
+        OnVanillaSmash(unit);
+        return true;
+    }
+
+    // Server GLOCK / legacy LAND — arm the same ground lock.
+    void OnLandCue()
+    {
+        void* unit = ActivePlayer();
+        OnVanillaLand(unit);
     }
 
     // INFO: glide default → glideslow when slow → slowfall when stalled.
@@ -720,6 +925,8 @@ namespace
         {
             if (g_skywardPitchLocked)
                 Pitch(unit) = g_skywardPitchLock;
+            if (g_liftPitchLocked)
+                Pitch(unit) = g_liftPitchLock;
             // Keep FlapUp on bones; Resolve remaps Fall/Jump from knockback → 1702.
             // No seqTime=0 every frame (that restarts the clip).
             PlayBoneAnim(unit, model, ANIM_FLAP_UP, 1.0f, -1.0f, false, false);
@@ -734,6 +941,8 @@ namespace
         {
             if (g_skywardPitchLocked)
                 Pitch(unit) = g_skywardPitchLock;
+            if (g_liftPitchLocked)
+                Pitch(unit) = g_liftPitchLock;
             PlayBoneAnim(unit, model, ANIM_SECOND_FLAP_UP, 1.0f, -1.0f, false, false);
             if (now >= g_phaseUntilMs)
             {
@@ -803,7 +1012,6 @@ namespace
         {
             ReleaseAnimDriver();
             ReleaseForcedForward();
-            g_haveLastCollidePos = false;
             return;
         }
 
@@ -812,11 +1020,30 @@ namespace
         if (!g_mode || !PlayerSeatedOnAdvFlyMount(unit))
         {
             g_haveLastFacing = false;
-            g_haveLastCollidePos = false;
             g_lastPhysicsMs = 0;
             ReleaseForcedForward();
             ReleaseAnimDriver();
             return;
+        }
+
+        // Post-land ground lock: mount is ground-only. Cliff = fall, never re-fly.
+        if (InGroundLock())
+        {
+            // Soft-land GLOCK already cleared FALLING; keep clearing fly flags.
+            bool const fallBack = UnitIsFalling(unit);
+            ApplyGroundLock(unit, true);
+            if (fallBack)
+            {
+                // FALLING return also restarts Fall bone — snap stand again.
+                ForceGroundMountPose(unit);
+            }
+            g_prevFlying = false;
+            g_prevFalling = UnitIsFalling(unit);
+            return;
+        }
+        if (g_groundLockUntilMs != 0 && GetTickCount() >= g_groundLockUntilMs)
+        {
+            g_groundLockUntilMs = 0;
         }
 
         const bool flyingNow = UnitIsFlying(unit);
@@ -824,41 +1051,94 @@ namespace
         const DWORD nowTick = GetTickCount();
         if (fallingNow)
             g_lastFallingMs = nowTick;
+        if (flyingNow)
+        {
+            if (!g_prevFlying)
+                g_airborneSinceMs = nowTick;
+            g_lastFlyingMs = nowTick;
+        }
         bool const recentFall = (g_lastFallingMs != 0)
             && (nowTick - g_lastFallingMs) < 1000;
-        const bool holdGround = (g_holdGroundUntilMs != 0 && nowTick < g_holdGroundUntilMs);
+        bool const recentFly = (g_lastFlyingMs != 0)
+            && (nowTick - g_lastFlyingMs) < kRecentFlyMs;
 
-        // New flight (cliff / skyward): cancel land hold so AdvFly can start.
-        if (flyingNow && !g_prevFlying)
-            g_holdGroundUntilMs = 0;
+        // Pad grace only for fresh takeoff — not after a real flight (log: grace blocked land 750ms).
+        if (g_airborneSinceMs != 0
+            && (nowTick - g_airborneSinceMs) > kTakeoffGraceMs
+            && g_takeoffGraceUntilMs != 0)
+        {
+            g_takeoffGraceUntilMs = 0;
+        }
+
+
+        // Rising into fly from knockback / cliff — don't treat pad FLY- as land.
+        if (flyingNow && !g_prevFlying && (fallingNow || recentFall))
+            ArmTakeoffGrace();
+
+        // Vanilla land: FLY- edge, or soft impact (FLY already gone, still settling).
+        if (!flyingNow && !InGroundLock()
+            && GetTickCount() >= g_takeoffGraceUntilMs
+            && (g_prevFlying || recentFly))
+        {
+            bool const settled = SampleSettle(unit);
+            // Soft land: Z quiet + FALLING (XY slide is normal). Cliff: large mz.
+            bool const softLand = fallingNow && SoftLandZQuiet();
+            // Bogus first sample after knockback (mz≫10) — skip, next frame decides.
+            bool const bogusDelta = g_lastMoveZ > 5.f || g_lastMoveXY > 5.f;
+            if (!bogusDelta && (!fallingNow || settled || softLand))
+            {
+                OnVanillaLand(unit);
+                g_prevFlying = false;
+                g_prevFalling = false;
+                return;
+            }
+            // Do not Dive/Glide while waiting — that is the "fake precipitate" look.
+            ReleaseForcedForward();
+            ReleaseAnimDriver();
+            g_prevFlying = false;
+            g_prevFalling = fallingNow;
+            return;
+        }
+
+        // After soft-land miss: block fall-into-fly reopen (FLY_on with wings).
+        if (flyingNow && recentFly && !g_prevFlying
+            && GetTickCount() < g_takeoffGraceUntilMs)
+        {
+            // takeoff path — allow
+        }
+        else if (flyingNow && recentFall && SoftLandZQuiet()
+            && GetTickCount() >= g_takeoffGraceUntilMs
+            && g_airborneSinceMs != 0
+            && (nowTick - g_airborneSinceMs) < 200)
+        {
+            // Brand-new FLY while Z quiet after falling = scrape re-fly → force land.
+            OnVanillaLand(unit);
+            g_prevFlying = false;
+            g_prevFalling = false;
+            return;
+        }
+
+        // Smash only if still flying after settle confirm window (wall, not dirt).
+        if (flyingNow && TryVanillaSmash(unit))
+        {
+            g_prevFlying = true;
+            g_prevFalling = fallingNow;
+        }
 
         if (!flyingNow)
             ReleaseForcedForward();
 
-        // Just landed (server LAND) — no AdvFly, no coast, no flap finish.
-        // Never apply hold-ground while falling or freshly entering fly from a fall.
-        if (holdGround && !flyingNow && !fallingNow && !recentFall)
-        {
-            ReleaseForcedForward();
-            ReleaseAnimDriver();
-            g_prevFlying = flyingNow;
-            return;
-        }
-        if (flyingNow || fallingNow || recentFall)
-            g_holdGroundUntilMs = 0;
-
-        // Grounded (no FLYING, no FALLING): leave AdvFly immediately.
+        // Not airborne: FSM off. Vanilla Fly(135) on CanFly mount is pass-through.
         if (!flyingNow && !fallingNow)
         {
-            g_haveLastFacing = false;
-            g_haveLastCollidePos = false;
-            g_lastPhysicsMs = 0;
-            ReleaseAnimDriver();
+            if (g_forcedAnimId > 0)
+                ReleaseAnimDriver();
             g_prevFlying = flyingNow;
+            g_prevFalling = fallingNow;
             return;
         }
 
-        if (flyingNow)
+        if (flyingNow || (fallingNow && PhaseIsLocked()))
         {
             float dt = 0.016f;
             if (g_lastPhysicsMs != 0 && nowTick > g_lastPhysicsMs)
@@ -867,27 +1147,24 @@ namespace
                 dt = 0.1f;
             g_lastPhysicsMs = nowTick;
 
-            ApplyWorldCollision(unit);
-            ApplyCoastAndBrake(unit, dt);
-            ApplyStallSink(unit, dt);
-            ApplySurgeLift(unit, dt);
-            ApplyTurnInertia(unit);
-
-            float* pos = UnitPos(unit);
-            g_lastCollidePos[0] = pos[0];
-            g_lastCollidePos[1] = pos[1];
-            g_lastCollidePos[2] = pos[2];
-            g_haveLastCollidePos = true;
+            if (flyingNow)
+            {
+                ApplyCoastAndBrake(unit, dt);
+                ApplyTurnInertia(unit);
+                ApplyAbilityLift(unit, dt);
+            }
+            else
+                ApplyAbilityLift(unit, dt);
         }
 
         void* model = AnimationModel(unit);
         if (!model)
         {
             g_prevFlying = flyingNow;
+            g_prevFalling = fallingNow;
             return;
         }
 
-        // Fall-into-fly: FLYING often arrives with FALLING already cleared — use recentFall.
         if (flyingNow && !g_prevFlying && !PhaseIsLocked()
             && (fallingNow || recentFall || Pitch(unit) < PITCH_DIVE_ENTER))
             BeginDive(unit, model);
@@ -898,7 +1175,6 @@ namespace
             TickFsm(unit, model);
         else if (fallingNow && recentFall && !PhaseIsLocked())
         {
-            // Still falling, not yet FLYING — start dive pose early so Space→fly is seamless.
             BeginDive(unit, model);
             TickFsm(unit, model);
         }
@@ -906,6 +1182,7 @@ namespace
             ReleaseAnimDriver();
 
         g_prevFlying = flyingNow;
+        g_prevFalling = fallingNow;
     }
 
     // Resolve override: ONLY on the mount model we are driving.
@@ -956,23 +1233,51 @@ namespace
             ReleaseForcedForward();
             g_haveLastFacing = false;
             g_lastPhysicsMs = 0;
-            g_braking = false;
-            g_stalled = false;
-            g_prevFlying = false;
-            g_holdGroundUntilMs = 0;
+        g_braking = false;
+        g_stalled = false;
+        g_prevFlying = false;
+        g_prevFalling = false;
+        g_takeoffGraceUntilMs = 0;
+        g_groundLockUntilMs = 0;
+        g_smashCooldownUntilMs = 0;
+        g_smashArmStartMs = 0;
+        g_smashMsgPending = false;
+        g_landMsgPending = false;
+        g_haveLastPos = false;
+        g_settleFrames = 0;
+        g_lastFlyingMs = 0;
+        g_airborneSinceMs = 0;
         }
         return 0;
     }
 
     int __cdecl LuaSkyridingLand(void* /*state*/)
     {
-        ForceGroundFromServer();
+        OnLandCue();
         return 0;
     }
 
     int __cdecl LuaSkyridingIsBraking(void* state)
     {
         wlua::PushNumber(state, g_braking ? 1.0 : 0.0);
+        return 1;
+    }
+
+    // Returns 1 once per smash — addon sends WALL so server stalls flightRate.
+    int __cdecl LuaSkyridingConsumeWallImpact(void* state)
+    {
+        int const hit = g_smashMsgPending ? 1 : 0;
+        g_smashMsgPending = false;
+        wlua::PushNumber(state, static_cast<double>(hit));
+        return 1;
+    }
+
+    // Returns 1 once per land — addon sends LAND so server arms GLOCK.
+    int __cdecl LuaSkyridingConsumeLand(void* state)
+    {
+        int const hit = g_landMsgPending ? 1 : 0;
+        g_landMsgPending = false;
+        wlua::PushNumber(state, static_cast<double>(hit));
         return 1;
     }
 
@@ -1027,8 +1332,27 @@ namespace
         return 0;
     }
 
+    int __cdecl LuaSkyridingSetGroundLock(void* state)
+    {
+        DWORD ms = kGroundLockMs;
+        if (wlua::GetTop(state) >= 1 && wlua::IsNumber(state, 1))
+        {
+            int v = static_cast<int>(wlua::ToNumber(state, 1));
+            if (v > 0)
+                ms = static_cast<DWORD>(v);
+        }
+        ArmGroundLock(ms);
+        void* unit = ActivePlayer();
+        if (unit)
+            ApplyGroundLock(unit);
+        return 0;
+    }
+
     int __cdecl LuaSkyridingFlap(void* state)
     {
+        if (InGroundLock())
+            return 0;
+
         const int kind = (wlua::GetTop(state) >= 1 && wlua::IsNumber(state, 1))
             ? static_cast<int>(wlua::ToNumber(state, 1)) : 0;
         if (PhaseIsLocked())
@@ -1042,21 +1366,25 @@ namespace
         g_boneAnimId = -1; // force SetBoneSequence
         g_boneAnimSpeed = 0.0f;
         g_inDive = false;
+        g_stalled = false; // Surge/Skyward recover from stall/smash
+        g_settleFrames = 0;
+        g_smashArmStartMs = 0;
         if (kind == 1)
         {
-            // Skyward: FlapUp → SecondFlapUp. Height = server ImpulseUp (same ground/air).
-            // Hold pitch so knockback cannot flatten facing.
+            // Skyward: FlapUp → SecondFlapUp. Pad grace only from ground takeoff.
+            if (!UnitIsFlying(unit))
+                ArmTakeoffGrace();
             g_skywardPitchLock = Pitch(unit);
             g_skywardPitchLocked = true;
+            g_liftPitchLock = Pitch(unit);
+            g_liftPitchLocked = true;
+            g_liftPerSec = 0.f;
+            g_liftUntilMs = GetTickCount() + kSkywardLiftMs;
             BeginSkywardFlap1(unit, model);
         }
         else
         {
-            // Lock pitch for the surge window — never allow knockback/anim to flatten to 0.
-            g_surgePitchLock = Pitch(unit);
-            g_surgePitchLocked = true;
-            g_surgeLiftUntilMs = GetTickCount() + kSurgeLiftMs;
-            // Bone-only + blend seq time — same path style as dive→glide (no snap).
+            StartAbilityLift(unit, kSurgeLiftPerSec, kSurgeLiftMs);
             PlayBoneAnim(unit, model, ANIM_FLAP_BIG, 1.0f, -1.0f, false, true);
             EnterPhase(AnimPhase::SurgeFlap, DUR_FLAP_BIG_MS);
         }
@@ -1138,7 +1466,10 @@ namespace
         wlua::RegisterFunction("WXL_SkyridingTick", &LuaSkyridingTick);
         wlua::RegisterFunction("WXL_SkyridingSetMode", &LuaSkyridingSetMode);
         wlua::RegisterFunction("WXL_SkyridingLand", &LuaSkyridingLand);
+        wlua::RegisterFunction("WXL_SkyridingSetGroundLock", &LuaSkyridingSetGroundLock);
         wlua::RegisterFunction("WXL_SkyridingIsBraking", &LuaSkyridingIsBraking);
+        wlua::RegisterFunction("WXL_SkyridingConsumeWallImpact", &LuaSkyridingConsumeWallImpact);
+        wlua::RegisterFunction("WXL_SkyridingConsumeLand", &LuaSkyridingConsumeLand);
         wlua::RegisterFunction("WXL_SkyridingSetCoastSpeed", &LuaSkyridingSetCoastSpeed);
         wlua::RegisterFunction("WXL_SkyridingSetStalled", &LuaSkyridingSetStalled);
         wlua::RegisterFunction("WXL_SkyridingSetClassicVertical", &LuaSkyridingSetClassicVertical);
