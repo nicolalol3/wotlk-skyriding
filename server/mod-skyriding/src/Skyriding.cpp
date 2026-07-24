@@ -54,9 +54,9 @@ namespace
     float sStallThreshold = 1.0f;   // below this → wings can't hold → sink
     float sDivePitch = -0.12f;
     float sClimbPitch = 0.12f;
-    float sDiveAccelPerSec = 0.55f; // slow climb to peak (~full dive: ~7s 2.5→6.5)
+    float sDiveAccelPerSec = 0.385f; // was 0.55; −30% dive accel
     float sHorizDecelPerSec = 0.35f;
-    float sClimbDecelPerSec = 0.95f;
+    float sClimbDecelPerSec = 0.2375f; // was 0.95; −75% climb decel
     float sBrakeDecelPerSec = 1.8f;
     float sStallSinkPerSec = 9.45f; // was 7.0; +35% stall descend
     float sSkywardSpeedZ = 42.0f;   // knockback jumpZ (ground takeoff + air climb)
@@ -104,9 +104,9 @@ namespace
         sStallThreshold = sConfigMgr->GetOption<float>("Skyriding.StallThreshold", 1.0f);
         sDivePitch = sConfigMgr->GetOption<float>("Skyriding.DivePitch", -0.12f);
         sClimbPitch = sConfigMgr->GetOption<float>("Skyriding.ClimbPitch", 0.12f);
-        sDiveAccelPerSec = sConfigMgr->GetOption<float>("Skyriding.DiveAccelPerSec", 0.55f);
+        sDiveAccelPerSec = sConfigMgr->GetOption<float>("Skyriding.DiveAccelPerSec", 0.385f);
         sHorizDecelPerSec = sConfigMgr->GetOption<float>("Skyriding.HorizDecelPerSec", 0.35f);
-        sClimbDecelPerSec = sConfigMgr->GetOption<float>("Skyriding.ClimbDecelPerSec", 0.95f);
+        sClimbDecelPerSec = sConfigMgr->GetOption<float>("Skyriding.ClimbDecelPerSec", 0.2375f);
         sBrakeDecelPerSec = sConfigMgr->GetOption<float>("Skyriding.BrakeDecelPerSec", 1.8f);
         sStallSinkPerSec = sConfigMgr->GetOption<float>("Skyriding.StallSinkPerSec", 9.45f);
         sSkywardSpeedZ = sConfigMgr->GetOption<float>("Skyriding.SkywardSpeedZ", 42.0f);
@@ -434,11 +434,16 @@ namespace
 
         // Below threshold → stall band (SlowFall anim via RATE).
         // Client owns Z sink (ApplyStallSink) — never UpdatePosition here (walls).
-        if (st.flightRate < sStallThreshold)
+        bool const stalled = st.flightRate < sStallThreshold;
+        if (stalled)
             st.band = "stall";
 
+        // Stall: stop forced coast — client StopCoastOnLand + sink; FORWARD fight = jerks.
         player->m_movementInfo.RemoveMovementFlag(MOVEMENTFLAG_BACKWARD);
-        player->m_movementInfo.AddMovementFlag(MOVEMENTFLAG_FORWARD);
+        if (stalled)
+            player->m_movementInfo.RemoveMovementFlag(MOVEMENTFLAG_FORWARD);
+        else
+            player->m_movementInfo.AddMovementFlag(MOVEMENTFLAG_FORWARD);
 
         player->SetSpeed(MOVE_FLIGHT, st.flightRate, true);
         SyncRate(player, st);

@@ -15,9 +15,9 @@ Skyriding.StallThreshold = 1.0
 
 Skyriding.DivePitch = -0.12
 Skyriding.ClimbPitch = 0.12
-Skyriding.DiveAccelPerSec = 0.55
+Skyriding.DiveAccelPerSec = 0.385
 Skyriding.HorizDecelPerSec = 0.35
-Skyriding.ClimbDecelPerSec = 0.95
+Skyriding.ClimbDecelPerSec = 0.2375
 Skyriding.BrakeDecelPerSec = 1.8
 Skyriding.StallSinkPerSec = 9.45
 Skyriding.SpdIntervalMs = 400

@@ -73,14 +73,9 @@ namespace
     constexpr uintptr_t kSetControlBit = 0x005FA170;
     constexpr uintptr_t kUnsetControlBit = 0x005FA450;
     constexpr uint32_t kControlBitForward = 0x10; // same bit MoveForwardStart uses
-    // Models | WMO | terrain (stall sink must stop on outdoor ground).
+    // Models | WMO | terrain.
     constexpr uint32_t kTraceHitFlags = 0x00000051;
-    constexpr uint32_t kTraceHitFlagsGround = 0x00100171;
     constexpr float kCollideSkinYards = 0.45f;
-    // Stall land: skin 0.45 left the mount floating (log: sink_ground_hit → ground mode).
-    constexpr float kStallLandSkinYards = 0.05f;
-    // Only commit OnVanillaLand when feet are this close to the hit (else clamp-only).
-    constexpr float kStallLandContactYards = 0.85f;
     constexpr float kCollideMaxStepYards = 28.0f;
     constexpr float kCollideProbeZ = 1.2f;
 
@@ -449,6 +444,20 @@ namespace
         g_forcedForwardBit = false;
     }
 
+    // One-shot at land / stall: kill residual coast without running every GLOCK tick
+    // (per-tick Unset fought W/A/S/D and needed several re-presses to "unlock").
+    void StopCoastOnLand(void* unit)
+    {
+        bool const wHeld = (GetAsyncKeyState('W') & 0x8000) != 0
+            || (GetAsyncKeyState(VK_UP) & 0x8000) != 0;
+        SetForwardControlBit(false);
+        g_forcedForwardBit = false;
+        if (!unit || wHeld)
+            return;
+        uint32_t& flags = MovementFlags(unit);
+        flags &= ~(MOVE_FLAG_FORWARD | MOVE_FLAG_BACKWARD | MOVE_FLAG_PENDING_STOP);
+    }
+
     // Never hover. Coast = keep FORWARD control bit so the engine moves (with walls).
     // Do not write UnitPos — that is what tunneled through geometry.
     // Only force the bit when W is NOT held; otherwise the client owns it.
@@ -544,58 +553,19 @@ namespace
     void OnVanillaLand(void* unit);
 
     // Rate stall / smash: SlowFall anim + gentle Z drop (server RATE drives g_stalled).
-    // Never sink during Skyward/Surge window — knockback apex ≠ stall.
+    // Z drop + ClampMove only — TraceLine→OnVanillaLand here caused stall slides/teleports.
     void ApplyStallSink(void* unit, float dt)
     {
         if (!unit || !g_stalled || dt <= 0.f)
             return;
         if (!UnitIsFlying(unit))
             return;
-        // Knockback apex / flap window — grace covers full Skyward chain.
-        // Re-entry stall must always sink.
         if (GetTickCount() < g_takeoffGraceUntilMs)
             return;
 
         float* pos = UnitPos(unit);
         float const from[3] = { pos[0], pos[1], pos[2] };
-        float const step = kStallSinkPerSec * dt;
-        pos[2] -= step;
-
-        // Ground probe (terrain+WMO) — outdoor heightmap is missed by kTraceHitFlags alone
-        // (log: reentry sink tunnels under the floor).
-        {
-            float start[3] = { from[0], from[1], from[2] + 0.35f };
-            float end[3] = { from[0], from[1], from[2] - (step + 2.5f) };
-            float hit[3] = {};
-            float distFrac = 1.0f;
-            int const tr = CallTraceLine(end, start, hit, &distFrac, kTraceHitFlagsGround);
-            (void)hit;
-            if (tr >= 0 && distFrac < 0.999f)
-            {
-                float const span = start[2] - end[2];
-                // distFrac only — hit[] is not a reliable C3Vector here (ClampMove uses frac).
-                float landZ = start[2] - span * distFrac + kStallLandSkinYards;
-                if (landZ > from[2])
-                    landZ = from[2];
-
-                float const gap = from[2] - landZ;
-                float nextZ = from[2] - step;
-                if (nextZ < landZ)
-                    nextZ = landZ;
-                pos[0] = from[0];
-                pos[1] = from[1];
-                pos[2] = nextZ;
-
-                // Far from ground: clamp only (do not ground-lock in mid-air).
-                if (gap > kStallLandContactYards)
-                    return;
-
-                pos[2] = landZ;
-                OnVanillaLand(unit);
-                return;
-            }
-        }
-
+        pos[2] -= kStallSinkPerSec * dt;
         ClampMoveAgainstWorld(from, pos);
     }
 
@@ -747,11 +717,9 @@ namespace
     }
 
     // Forced ground mount mode: may FALL off cliffs, must NOT re-enter FLYING.
-    // Soft land (quiet Z): also clear FALLING — keeping it plays vanilla "precipitate"
-    // for the whole GLOCK window (log: OnVanillaLand soft + fall=1 until glock_expire).
+    // Do not Unset FORWARD here — this runs every GLOCK tick and fights player keys.
     void ApplyGroundLock(void* unit, bool clearFalling)
     {
-        ReleaseForcedForward();
         ReleaseAnimDriver();
         if (!unit)
             return;
@@ -822,7 +790,7 @@ namespace
     void OnVanillaLand(void* unit)
     {
         KillAbilityState();
-        ReleaseForcedForward();
+        StopCoastOnLand(unit);
         g_stalled = false;
         g_coastYardsPerSec = kMinCoastYardsPerSec;
         g_landMsgPending = true;
@@ -832,11 +800,8 @@ namespace
         ArmGroundLock(kGroundLockMs);
         if (unit)
         {
-            // Clear FLY only — keep/set FALLING so the last cm can settle (log: land
-            // with fall=0 + clearFalling froze the mount a few cm above dirt).
-            ApplyGroundLock(unit, false);
-            uint32_t& flags = MovementFlags(unit);
-            flags |= (MOVE_FLAG_FALLING | MOVE_FLAG_FALLING_FAR);
+            // Soft impact still has FALLING — clear it or vanilla Fall plays ~GLOCK.
+            ApplyGroundLock(unit, true);
             ForceGroundMountPose(unit);
         }
         else
@@ -847,7 +812,7 @@ namespace
     void OnVanillaSmash(void* unit)
     {
         KillAbilityState();
-        ReleaseForcedForward();
+        StopCoastOnLand(unit);
         g_stalled = true;
         g_coastYardsPerSec = kMinCoastYardsPerSec;
         g_smashMsgPending = true;
@@ -1425,7 +1390,10 @@ namespace
         if (wlua::GetTop(state) >= 1 && wlua::IsNumber(state, 1))
         {
             g_flightRateNorm = static_cast<float>(wlua::ToNumber(state, 1));
-            g_stalled = g_flightRateNorm < 0.f;
+            bool const stall = g_flightRateNorm < 0.f;
+            if (stall && !g_stalled)
+                StopCoastOnLand(ActivePlayer());
+            g_stalled = stall;
         }
         return 0;
     }
@@ -1448,7 +1416,10 @@ namespace
         ArmGroundLock(ms);
         void* unit = ActivePlayer();
         if (unit)
+        {
+            StopCoastOnLand(unit);
             ApplyGroundLock(unit);
+        }
         return 0;
     }
 
