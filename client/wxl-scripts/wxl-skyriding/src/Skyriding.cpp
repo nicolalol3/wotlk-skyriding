@@ -220,14 +220,23 @@ namespace
     {
         if (!model || !g_hasSequence)
             return false;
-        const uintptr_t shared = *reinterpret_cast<uintptr_t*>(
-            reinterpret_cast<uintptr_t>(model) + kOffModelShared);
-        if (!shared)
+        // Takeoff race: parent CM2Model exists but shared/M2Data is still null/garbage
+        // (crash: WXL_SkyridingTick → 0x825E5C HasSequence reading 0x1210 from ESI≈0x1200).
+        __try
+        {
+            const uintptr_t shared = *reinterpret_cast<uintptr_t*>(
+                reinterpret_cast<uintptr_t>(model) + kOffModelShared);
+            if (shared < 0x10000)
+                return false;
+            void* modelData = *reinterpret_cast<void**>(shared + kOffSharedM2Data);
+            if (reinterpret_cast<uintptr_t>(modelData) < 0x10000)
+                return false;
+            return g_hasSequence(modelData, animId);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
             return false;
-        void* modelData = *reinterpret_cast<void**>(shared + kOffSharedM2Data);
-        if (!modelData)
-            return false;
-        return g_hasSequence(modelData, animId);
+        }
     }
 
     bool ModelSupportsAdvFly(void* model)
@@ -253,13 +262,13 @@ namespace
             return nullptr;
         void* parent = *reinterpret_cast<void**>(
             reinterpret_cast<uintptr_t>(body) + kModelParentOffset);
+        // Only return models that actually expose AdvFly — never raw parent just
+        // because MountDisplayId is set (M2 still loading → HasSequence AV).
         if (parent && ModelSupportsAdvFly(parent))
             return parent;
         if (ModelSupportsAdvFly(body))
             return body;
-        if (parent && PlayerMountDisplayId(player) != 0)
-            return parent;
-        return body;
+        return nullptr;
     }
 
     bool PlayerSeatedOnAdvFlyMount(void* player)
@@ -267,16 +276,13 @@ namespace
         if (!player)
             return false;
         void* body = UnitModel(player);
-        if (body)
-        {
-            void* parent = *reinterpret_cast<void**>(
-                reinterpret_cast<uintptr_t>(body) + kModelParentOffset);
-            if (parent && ModelSupportsAdvFly(parent))
-                return true;
-            if (parent && PlayerMountDisplayId(player) != 0)
-                return true;
-        }
-        return PlayerMountDisplayId(player) != 0;
+        if (!body)
+            return false;
+        void* parent = *reinterpret_cast<void**>(
+            reinterpret_cast<uintptr_t>(body) + kModelParentOffset);
+        if (parent && ModelSupportsAdvFly(parent))
+            return true;
+        return ModelSupportsAdvFly(body);
     }
 
     uint32_t& MovementFlags(void* unit)

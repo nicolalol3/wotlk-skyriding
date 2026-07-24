@@ -69,16 +69,23 @@ namespace
         if (!model || !g_hasSequenceById)
             return false;
 
-        const uintptr_t modelAddr = reinterpret_cast<uintptr_t>(model);
-        const uintptr_t shared = *reinterpret_cast<uintptr_t*>(modelAddr + kOffModelShared);
-        if (!shared)
-            return false;
+        __try
+        {
+            const uintptr_t modelAddr = reinterpret_cast<uintptr_t>(model);
+            const uintptr_t shared = *reinterpret_cast<uintptr_t*>(modelAddr + kOffModelShared);
+            if (shared < 0x10000)
+                return false;
 
-        void* modelData = *reinterpret_cast<void**>(shared + kOffSharedM2Data);
-        if (!modelData)
-            return false;
+            void* modelData = *reinterpret_cast<void**>(shared + kOffSharedM2Data);
+            if (reinterpret_cast<uintptr_t>(modelData) < 0x10000)
+                return false;
 
-        return g_hasSequenceById(modelData, animationId);
+            return g_hasSequenceById(modelData, animationId);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
     }
 
     int ResolveExtendedAnimationId(void* unit, int animationId, void* model)
