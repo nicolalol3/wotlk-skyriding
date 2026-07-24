@@ -8,10 +8,12 @@
 #include "Config.h"
 #include "GridTerrainData.h"
 #include "Log.h"
+#include "MotionMaster.h"
 #include "MovementHandlerScript.h"
 #include "Player.h"
 #include "ScriptMgr.h"
 #include "Spell.h"
+#include "SpellAuras.h"
 #include "SpellInfo.h"
 #include "SpellMgr.h"
 #include "Unit.h"
@@ -20,6 +22,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <string>
 #include <unordered_map>
 
@@ -29,6 +32,15 @@ namespace
     constexpr uint32 SPELL_FLIGHT_CHARGES = 98052;
     constexpr uint32 SPELL_SURGE_FORWARD = 98100;
     constexpr uint32 SPELL_SKYWARD_ASCENT = 98101;
+    // Same parachute as mod-noflyzone (Eastern/Western Plaguelands cylinder).
+    constexpr uint32 SPELL_PARACHUTE_BUFF = 44795;
+    constexpr uint32 SPELL_SAFE_FALL = 29950;
+    constexpr uint32 SPELL_DRUID_FLIGHT_FORM = 33943;
+    constexpr uint32 SPELL_DRUID_SWIFT_FLIGHT_FORM = 40120;
+    constexpr uint32 REENTRY_PARA_DELAY_MS = 500;
+    constexpr uint32 REENTRY_SAFE_FALL_MS = 30000;
+    constexpr uint32 REENTRY_PARA_DURATION_MS = 10000;
+    constexpr float REENTRY_AIR_HEIGHT = 5.f;
 
     bool sEnabled = true;
     uint32 sVigorMax = 6;
@@ -67,6 +79,12 @@ namespace
         uint32 landGraceUntilMs = 0;
         uint32 groundLockUntilMs = 0; // forced ground mode after land
         uint32 spdAccMs = 0;
+        // Re-send MODE/RATE after login / map load until addon is alive.
+        uint32 handshakeUntilMs = 0;
+        uint32 nextHandshakeMs = 0;
+        // Mid-air login/teleport: dismount + delayed parachute (noflyzone pattern).
+        uint32 reentryParaDelayMs = 0;
+        bool reentryHandled = false;
         char const* band = "idle";
     };
 
@@ -186,6 +204,16 @@ namespace
         SendAddon(player, "TURN\t" + std::to_string(sTurnRate));
     }
 
+    void BeginClientHandshake(SkyridingState& st, uint32 durationMs = 6000)
+    {
+        uint32 const now = getMSTime();
+        st.handshakeUntilMs = now + durationMs;
+        st.nextHandshakeMs = now; // fire on next Update
+        st.modeSynced = false;
+    }
+
+    // Mid-air re-entry = existing stall band until land.
+    // Rejected: teleport-to-ground, FLY strip, UpdatePosition, SetBoneSequence thrash.
     void ApplyTurnRate(Player* player, bool enable)
     {
         if (!player)
@@ -206,9 +234,115 @@ namespace
         if (norm > 1.f)
             norm = 1.f;
         if (st.flightRate < sStallThreshold)
-            norm = -std::max(0.01f, norm);
+            norm = -1.f;
 
         SendAddon(player, "RATE\t" + std::to_string(norm));
+    }
+
+    void ApplyTimedAura(Player* player, uint32 spellId, uint32 durationMs)
+    {
+        if (!player)
+            return;
+        if (Aura* aura = player->AddAura(spellId, player))
+        {
+            aura->SetDuration(int32(durationMs));
+            aura->SetMaxDuration(int32(durationMs));
+        }
+    }
+
+    bool IsAirborneAboveGround(Player* player, float minHeight)
+    {
+        if (!player || !player->GetMap())
+            return false;
+        float const z = player->GetPositionZ();
+        float const ground = player->GetMap()->GetHeight(
+            player->GetPhaseMask(), player->GetPositionX(), player->GetPositionY(),
+            z + 5.f, true, 500.f);
+        return ground > -50000.f && (z - ground) > minHeight;
+    }
+
+    // Hard fix for mid-air re-entry: no stall-lock / client sink — dismount + parachute.
+    // Mirrors mod-noflyzone BeginDismountAndFall / ApplyParachute.
+    void ForceReentryDismountParachute(Player* player, SkyridingState& st)
+    {
+        if (!player || player->IsGameMaster() || st.reentryHandled)
+            return;
+
+        bool const flying = player->IsFlying();
+        bool const airborne = IsAirborneAboveGround(player, REENTRY_AIR_HEIGHT);
+        if (!flying && !airborne)
+            return;
+        // Grounded fall without fly mount — leave alone.
+        if (!flying && !player->IsMounted() && !player->HasAuraType(SPELL_AURA_MOUNTED))
+            return;
+
+        st.reentryHandled = true;
+
+        if (player->HasAura(SPELL_DRUID_SWIFT_FLIGHT_FORM))
+            player->RemoveAurasDueToSpell(SPELL_DRUID_SWIFT_FLIGHT_FORM);
+        if (player->HasAura(SPELL_DRUID_FLIGHT_FORM))
+            player->RemoveAurasDueToSpell(SPELL_DRUID_FLIGHT_FORM);
+
+        player->Dismount();
+        player->RemoveAurasByType(SPELL_AURA_MOUNTED);
+        player->SetCanFly(false);
+        ApplyTimedAura(player, SPELL_SAFE_FALL, REENTRY_SAFE_FALL_MS);
+
+        if (flying || airborne)
+            player->GetMotionMaster()->MoveFall();
+
+        st.reentryParaDelayMs = REENTRY_PARA_DELAY_MS;
+        st.flightRate = sBaseFlightRate;
+        st.braking = false;
+        st.wasFlying = false;
+        st.band = "idle";
+        st.modeSynced = false;
+        SyncMode(player, st, false);
+        SyncRate(player, st);
+        ApplyTurnRate(player, false);
+    }
+
+    void TickReentryParachute(Player* player, SkyridingState& st, uint32 diff)
+    {
+        if (!player || st.reentryParaDelayMs == 0 || diff == 0)
+            return;
+        if (st.reentryParaDelayMs > diff)
+        {
+            st.reentryParaDelayMs -= diff;
+            return;
+        }
+        st.reentryParaDelayMs = 0;
+        ApplyTimedAura(player, SPELL_PARACHUTE_BUFF, REENTRY_PARA_DURATION_MS);
+        player->SetFeatherFall(true);
+    }
+
+    void TickReentryGroundClear(Player* player, SkyridingState& st)
+    {
+        if (!player || !st.reentryHandled || st.reentryParaDelayMs != 0)
+            return;
+        if (IsAirborneAboveGround(player, 1.5f))
+            return;
+        player->SetFeatherFall(false);
+    }
+
+    void TickClientHandshake(Player* player, SkyridingState& st)
+    {
+        if (st.handshakeUntilMs == 0)
+            return;
+        uint32 const now = getMSTime();
+        if (now >= st.handshakeUntilMs)
+        {
+            st.handshakeUntilMs = 0;
+            return;
+        }
+        if (now < st.nextHandshakeMs)
+            return;
+        st.nextHandshakeMs = now + 1000;
+        st.modeSynced = false;
+        SyncRate(player, st);
+        SyncCharges(player, st, true);
+        // Login often has fly=0 for a tick — retry parachute while handshake alive.
+        ForceReentryDismountParachute(player, st);
     }
 
     void SyncSpeedDebug(Player* player, SkyridingState& st, uint32 diff, float pitch)
@@ -298,15 +432,10 @@ namespace
         if (st.flightRate < sMinFlightRate)
             st.flightRate = sMinFlightRate;
 
-        // Below threshold → stall band (SlowFall anim via RATE) + sink Z.
+        // Below threshold → stall band (SlowFall anim via RATE).
+        // Client owns Z sink (ApplyStallSink) — never UpdatePosition here (walls).
         if (st.flightRate < sStallThreshold)
-        {
             st.band = "stall";
-            float const z = player->GetPositionZ() - sStallSinkPerSec * dt;
-            player->UpdatePosition(
-                player->GetPositionX(), player->GetPositionY(), z,
-                player->GetOrientation());
-        }
 
         player->m_movementInfo.RemoveMovementFlag(MOVEMENTFLAG_BACKWARD);
         player->m_movementInfo.AddMovementFlag(MOVEMENTFLAG_FORWARD);
@@ -453,10 +582,17 @@ public:
         st.rechargeLeftMs = 0;
         st.flightRate = sBaseFlightRate;
         st.modeSynced = false;
-        SyncCharges(player, st, true);
-        SyncMode(player, st, false);
+        // Seed fly edge — login while airborne must not look like takeoff/land.
+        st.wasFlying = player->IsFlying();
         st.landGraceUntilMs = 0;
         st.groundLockUntilMs = 0;
+        st.reentryParaDelayMs = 0;
+        st.reentryHandled = false;
+        BeginClientHandshake(st);
+        SyncCharges(player, st, true);
+        SyncMode(player, st, false);
+        SyncRate(player, st);
+        ForceReentryDismountParachute(player, st);
     }
 
     void OnPlayerLogout(Player* player) override
@@ -464,6 +600,20 @@ public:
         if (!player)
             return;
         sStates.erase(player->GetGUID());
+    }
+
+    void OnPlayerMapChanged(Player* player) override
+    {
+        if (!sEnabled || !player)
+            return;
+        SkyridingState& st = GetState(player);
+        // LFG / taxi / instance: client reloads; force MODE re-handshake.
+        st.wasFlying = player->IsFlying();
+        st.landGraceUntilMs = 0;
+        st.reentryHandled = false;
+        BeginClientHandshake(st);
+        ForceReentryDismountParachute(player, st);
+        SyncRate(player, st);
     }
 
     void OnPlayerUpdate(Player* player, uint32 diff) override
@@ -474,16 +624,20 @@ public:
         SkyridingState& st = GetState(player);
         TickVigor(st, diff);
         SyncCharges(player, st);
+        TickClientHandshake(player, st);
+        TickReentryParachute(player, st, diff);
+        TickReentryGroundClear(player, st);
 
         bool const candidate = IsSkyridingCandidate(player);
         bool const flying = player->IsFlying();
         bool const groundLocked = InGroundLock(st);
+        bool const falling = player->HasUnitMovementFlag(
+            MOVEMENTFLAG_FALLING | MOVEMENTFLAG_FALLING_FAR);
 
         if (candidate)
             EnsureSpells(player);
 
-        // Mode ON on ground+air so client gates Space before takeoff; takeoff = Skyward.
-        SyncMode(player, st, candidate);
+        SyncMode(player, st, candidate && !groundLocked);
         ApplyTurnRate(player, candidate && flying && !groundLocked);
 
         if (candidate && !sClassicVertical)
@@ -492,36 +646,22 @@ public:
                 MOVEMENTFLAG_ASCENDING | MOVEMENTFLAG_DESCENDING);
 
             if (groundLocked)
-            {
-                // Forced ground mode: strip fly even mid-fall so cliff = fall, not skyriding.
                 ApplyGroundLockFlags(player);
-            }
-            else
+            else if (!flying && !st.wasFlying && !falling)
             {
-                // Ground Space tries ASC+FLY same frame — refuse FLYING if not already airborne.
-                bool const falling = player->HasUnitMovementFlag(
-                    MOVEMENTFLAG_FALLING | MOVEMENTFLAG_FALLING_FAR);
-                if (!flying && !st.wasFlying && !falling)
-                    player->m_movementInfo.RemoveMovementFlag(
-                        MOVEMENTFLAG_FLYING | MOVEMENTFLAG_DISABLE_GRAVITY);
+                player->m_movementInfo.RemoveMovementFlag(
+                    MOVEMENTFLAG_FLYING | MOVEMENTFLAG_DISABLE_GRAVITY);
             }
         }
 
         bool const inLandGrace = getMSTime() < st.landGraceUntilMs;
 
         if (candidate && flying && !groundLocked)
-        {
-            // Never reset flightRate on FLY rising edge — that wiped Skyward
-            // momentum when knockback ended (even after boost mid-climb).
             TickMomentum(player, st, diff);
-        }
         else if (st.wasFlying && !flying)
         {
             ApplyTurnRate(player, false);
             st.braking = false;
-            // Knockback / cliff keep rate. Solid ground only → base + GLOCK.
-            bool const falling = player->HasUnitMovementFlag(
-                MOVEMENTFLAG_FALLING | MOVEMENTFLAG_FALLING_FAR);
             if (!falling && !inLandGrace)
             {
                 st.flightRate = sBaseFlightRate;
@@ -586,6 +726,18 @@ public:
             st.wasFlying = false;
             // Push cleared flags so client FALLING does not bounce back from authority.
             player->SendMovementFlagUpdate(true);
+        }
+        // RESYNC\t1 — client finished loading; parachute if still mid-air.
+        else if (body.rfind("RESYNC\t", 0) == 0)
+        {
+            SkyridingState& st = GetState(player);
+            st.wasFlying = player->IsFlying();
+            st.reentryHandled = false;
+            BeginClientHandshake(st, 3000);
+            SyncCharges(player, st, true);
+            SyncMode(player, st, IsSkyridingCandidate(player));
+            ForceReentryDismountParachute(player, st);
+            SyncRate(player, st);
         }
     }
 };

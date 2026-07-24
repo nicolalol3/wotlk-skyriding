@@ -73,9 +73,14 @@ namespace
     constexpr uintptr_t kSetControlBit = 0x005FA170;
     constexpr uintptr_t kUnsetControlBit = 0x005FA450;
     constexpr uint32_t kControlBitForward = 0x10; // same bit MoveForwardStart uses
-    // Models | WMO | unknown (bits accepted by TraceLine's 0x40F300FF gate).
+    // Models | WMO | terrain (stall sink must stop on outdoor ground).
     constexpr uint32_t kTraceHitFlags = 0x00000051;
+    constexpr uint32_t kTraceHitFlagsGround = 0x00100171;
     constexpr float kCollideSkinYards = 0.45f;
+    // Stall land: skin 0.45 left the mount floating (log: sink_ground_hit → ground mode).
+    constexpr float kStallLandSkinYards = 0.05f;
+    // Only commit OnVanillaLand when feet are this close to the hit (else clamp-only).
+    constexpr float kStallLandContactYards = 0.85f;
     constexpr float kCollideMaxStepYards = 28.0f;
     constexpr float kCollideProbeZ = 1.2f;
 
@@ -98,7 +103,8 @@ namespace
 
     // Pitch dive enter/exit (radians). Small hysteresis — exit as soon as you pull up,
     // not when you reach ~0 (that felt like a long delay).
-    constexpr float PITCH_DIVE_ENTER = -0.35f;
+    // Enter was -0.35; +70% magnitude so dive needs a steeper nose-down (retail-like).
+    constexpr float PITCH_DIVE_ENTER = -0.595f;
     constexpr float PITCH_DIVE_EXIT = -0.28f;
 
 
@@ -459,7 +465,7 @@ namespace
         if (g_stalled)
         {
             ReleaseForcedForward();
-            flags &= ~(MOVE_FLAG_BACKWARD | MOVE_FLAG_PENDING_STOP);
+            flags &= ~(MOVE_FLAG_FORWARD | MOVE_FLAG_BACKWARD | MOVE_FLAG_PENDING_STOP);
             return;
         }
 
@@ -529,6 +535,8 @@ namespace
         g_liftUntilMs = GetTickCount() + durationMs;
     }
 
+    void OnVanillaLand(void* unit);
+
     // Rate stall / smash: SlowFall anim + gentle Z drop (server RATE drives g_stalled).
     // Never sink during Skyward/Surge window — knockback apex ≠ stall.
     void ApplyStallSink(void* unit, float dt)
@@ -538,12 +546,50 @@ namespace
         if (!UnitIsFlying(unit))
             return;
         // Knockback apex / flap window — grace covers full Skyward chain.
+        // Re-entry stall must always sink.
         if (GetTickCount() < g_takeoffGraceUntilMs)
             return;
 
         float* pos = UnitPos(unit);
         float const from[3] = { pos[0], pos[1], pos[2] };
-        pos[2] -= kStallSinkPerSec * dt;
+        float const step = kStallSinkPerSec * dt;
+        pos[2] -= step;
+
+        // Ground probe (terrain+WMO) — outdoor heightmap is missed by kTraceHitFlags alone
+        // (log: reentry sink tunnels under the floor).
+        {
+            float start[3] = { from[0], from[1], from[2] + 0.35f };
+            float end[3] = { from[0], from[1], from[2] - (step + 2.5f) };
+            float hit[3] = {};
+            float distFrac = 1.0f;
+            int const tr = CallTraceLine(end, start, hit, &distFrac, kTraceHitFlagsGround);
+            (void)hit;
+            if (tr >= 0 && distFrac < 0.999f)
+            {
+                float const span = start[2] - end[2];
+                // distFrac only — hit[] is not a reliable C3Vector here (ClampMove uses frac).
+                float landZ = start[2] - span * distFrac + kStallLandSkinYards;
+                if (landZ > from[2])
+                    landZ = from[2];
+
+                float const gap = from[2] - landZ;
+                float nextZ = from[2] - step;
+                if (nextZ < landZ)
+                    nextZ = landZ;
+                pos[0] = from[0];
+                pos[1] = from[1];
+                pos[2] = nextZ;
+
+                // Far from ground: clamp only (do not ground-lock in mid-air).
+                if (gap > kStallLandContactYards)
+                    return;
+
+                pos[2] = landZ;
+                OnVanillaLand(unit);
+                return;
+            }
+        }
+
         ClampMoveAgainstWorld(from, pos);
     }
 
@@ -636,6 +682,7 @@ namespace
         EnterPhase(AnimPhase::SkywardFlap1, DUR_FLAP_UP_MS);
     }
 
+    // Mid-air re-entry is server-owned (dismount + parachute). No client stall-lock.
     bool PhaseIsLocked()
     {
         return g_phase == AnimPhase::SurgeFlap
@@ -779,9 +826,11 @@ namespace
         ArmGroundLock(kGroundLockMs);
         if (unit)
         {
-            // Soft impact still has FALLING — clear it or vanilla Fall plays ~GLOCK (2s).
-            ApplyGroundLock(unit, true);
-            // Snap bones off stuck AdvFly Glide/Dive pose on soft land.
+            // Clear FLY only — keep/set FALLING so the last cm can settle (log: land
+            // with fall=0 + clearFalling froze the mount a few cm above dirt).
+            ApplyGroundLock(unit, false);
+            uint32_t& flags = MovementFlags(unit);
+            flags |= (MOVE_FLAG_FALLING | MOVE_FLAG_FALLING_FAR);
             ForceGroundMountPose(unit);
         }
         else
@@ -1043,6 +1092,19 @@ namespace
 
         ApplyMovementGate(unit);
 
+        // Ground lock must run even after MODE off (land clears MODE ~same frame).
+        if (InGroundLock())
+        {
+            // While still falling onto dirt, do NOT clear FALLING (that freezes hover).
+            bool const falling = UnitIsFalling(unit);
+            ApplyGroundLock(unit, !falling);
+            g_prevFlying = false;
+            g_prevFalling = falling;
+            return;
+        }
+        if (g_groundLockUntilMs != 0 && GetTickCount() >= g_groundLockUntilMs)
+            g_groundLockUntilMs = 0;
+
         if (!g_mode || !PlayerSeatedOnAdvFlyMount(unit))
         {
             g_haveLastFacing = false;
@@ -1050,26 +1112,6 @@ namespace
             ReleaseForcedForward();
             ReleaseAnimDriver();
             return;
-        }
-
-        // Post-land ground lock: mount is ground-only. Cliff = fall, never re-fly.
-        if (InGroundLock())
-        {
-            // Soft-land GLOCK already cleared FALLING; keep clearing fly flags.
-            bool const fallBack = UnitIsFalling(unit);
-            ApplyGroundLock(unit, true);
-            if (fallBack)
-            {
-                // FALLING return also restarts Fall bone — snap stand again.
-                ForceGroundMountPose(unit);
-            }
-            g_prevFlying = false;
-            g_prevFalling = UnitIsFalling(unit);
-            return;
-        }
-        if (g_groundLockUntilMs != 0 && GetTickCount() >= g_groundLockUntilMs)
-        {
-            g_groundLockUntilMs = 0;
         }
 
         const bool flyingNow = UnitIsFlying(unit);
@@ -1266,17 +1308,19 @@ namespace
     {
         const int on = (wlua::GetTop(state) >= 1 && wlua::IsNumber(state, 1))
             ? static_cast<int>(wlua::ToNumber(state, 1)) : 0;
-        g_mode = on != 0;
-        if (!g_mode)
-        {
-            ReleaseAnimDriver();
-            ReleaseForcedForward();
-            g_haveLastFacing = false;
-            g_lastPhysicsMs = 0;
+        bool const want = on != 0;
+
+        // Handshake re-sends MODE every second — ignore duplicates or anim thrash.
+        if (want == g_mode)
+            return 0;
+
+        // Hard reset on real MODE edge — login/teleport must not inherit FSM/edges.
+        ReleaseAnimDriver();
+        ReleaseForcedForward();
+        g_haveLastFacing = false;
+        g_lastPhysicsMs = 0;
         g_braking = false;
         g_stalled = false;
-        g_prevFlying = false;
-        g_prevFalling = false;
         g_takeoffGraceUntilMs = 0;
         g_groundLockUntilMs = 0;
         g_smashCooldownUntilMs = 0;
@@ -1286,8 +1330,16 @@ namespace
         g_haveLastPos = false;
         g_settleFrames = 0;
         g_lastFlyingMs = 0;
+        g_lastFallingMs = 0;
         g_airborneSinceMs = 0;
-        }
+
+        g_mode = want;
+
+        void* unit = ActivePlayer();
+        g_prevFlying = g_mode && unit && UnitIsFlying(unit);
+        g_prevFalling = g_mode && unit && UnitIsFalling(unit);
+        if (g_prevFlying)
+            g_airborneSinceMs = GetTickCount();
         return 0;
     }
 
@@ -1369,6 +1421,12 @@ namespace
             g_flightRateNorm = static_cast<float>(wlua::ToNumber(state, 1));
             g_stalled = g_flightRateNorm < 0.f;
         }
+        return 0;
+    }
+
+    int __cdecl LuaSkyridingStallLock(void* /*state*/)
+    {
+        // Legacy no-op — mid-air re-entry is server dismount + parachute.
         return 0;
     }
 
@@ -1534,6 +1592,7 @@ namespace
         wlua::RegisterFunction("WXL_SkyridingSetClassicVertical", &LuaSkyridingSetClassicVertical);
         wlua::RegisterFunction("WXL_SkyridingSetTurnRate", &LuaSkyridingSetTurnRate);
         wlua::RegisterFunction("WXL_SkyridingSetFlightRate", &LuaSkyridingSetFlightRate);
+        wlua::RegisterFunction("WXL_SkyridingStallLock", &LuaSkyridingStallLock);
         wlua::RegisterFunction("WXL_SkyridingFlap", &LuaSkyridingFlap);
         wlua::RegisterFunction("WXL_PlayMountAnim", &LuaPlayMountAnim);
         wlua::RegisterFunction("WXL_SkyridingDbg", &LuaSkyridingDbg);

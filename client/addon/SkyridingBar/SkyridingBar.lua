@@ -1,5 +1,5 @@
 -- Horizon Skyriding charge bar (flying mount).
--- Server: HORIZON_SKY  CHG\t...  MODE\t0|1  ANIM\t0|1  LAND\t1  VERT\t0|1  TURN\t0.4
+-- Server: HORIZON_SKY  CHG\t...  MODE\t0|1  ANIM\t0|1  LAND\t1  STALLLOCK\t1  VERT\t0|1  TURN\t0.4
 -- VERT: 0 = block Space/X ascend/descend (WXL), 1 = allow classic vertical
 -- TURN: mouse-yaw inertia multiplier while airborne (1.0=normal, 0.75=−25%)
 -- Cast Surge / Skyward from action bar while on a flying mount.
@@ -16,14 +16,6 @@ local lastFlapMs = 0
 if RegisterAddonMessagePrefix then
     RegisterAddonMessagePrefix(PREFIX)
 end
-
--- #region agent log
-local function Dbg(hyp, msg, extra)
-    if type(WXL_SkyridingDbg) == "function" then
-        WXL_SkyridingDbg(hyp, msg, tostring(extra or ""))
-    end
-end
--- #endregion
 
 local frame = CreateFrame("Frame", "HorizonSkyridingBar", UIParent)
 frame:SetWidth(180)
@@ -151,9 +143,22 @@ local function HandleSkyPayload(message)
     elseif cmd == "ANIM" then
         TriggerFlap(tonumber(a) or 0, "addon_ANIM")
     elseif cmd == "LAND" then
-        -- Server GetMapHeight touchdown — drop AdvFly NOW (any phase).
-        if type(WXL_SkyridingLand) == "function" then
+        if type(WXL_SkyridingSetGroundLock) == "function" then
+            WXL_SkyridingSetGroundLock(2000)
+        elseif type(WXL_SkyridingLand) == "function" then
             WXL_SkyridingLand()
+        end
+    elseif cmd == "GLOCK" then
+        local ms = tonumber(a) or 2000
+        if type(WXL_SkyridingSetGroundLock) == "function" then
+            WXL_SkyridingSetGroundLock(ms)
+        end
+    elseif cmd == "SETTLE" then
+        -- Legacy no-op.
+    elseif cmd == "STALLLOCK" then
+        -- Mid-air login/teleport: stall until land (no flaps / upright sink).
+        if type(WXL_SkyridingStallLock) == "function" then
+            WXL_SkyridingStallLock()
         end
     elseif cmd == "MODE" then
         if type(WXL_SkyridingSetMode) == "function" then
@@ -165,17 +170,11 @@ local function HandleSkyPayload(message)
         if type(WXL_SkyridingSetClassicVertical) == "function" then
             WXL_SkyridingSetClassicVertical(allow)
         end
-        -- #region agent log
-        Dbg("H14", "vert_addon", "allow=" .. tostring(allow))
-        -- #endregion
     elseif cmd == "TURN" then
         local rate = tonumber(a) or 0.75
         if type(WXL_SkyridingSetTurnRate) == "function" then
             WXL_SkyridingSetTurnRate(rate)
         end
-        -- #region agent log
-        Dbg("H15", "turn_addon", "rate=" .. tostring(rate))
-        -- #endregion
     end
 end
 
@@ -195,16 +194,14 @@ frame:RegisterEvent("CHAT_MSG_WHISPER_INFORM")
 frame:RegisterEvent("UNIT_SPELLCAST_START")
 frame:RegisterEvent("UNIT_SPELLCAST_SUCCEEDED")
 frame:RegisterEvent("PLAYER_ENTERING_WORLD")
+frame:RegisterEvent("PLAYER_LEAVING_WORLD")
 frame:SetScript("OnEvent", function(self, event, ...)
     if event == "CHAT_MSG_ADDON" then
         local prefix, message = ...
         OnAddonMessage(prefix, message)
     elseif event == "CHAT_MSG_WHISPER" or event == "CHAT_MSG_WHISPER_INFORM" then
-        local message, sender, language = ...
+        local message = ...
         if type(message) == "string" and message:find(PREFIX, 1, true) then
-            -- #region agent log
-            Dbg("H8", "whisper_addon", tostring(language))
-            -- #endregion
             HandleSkyPayload(message)
         end
     elseif event == "UNIT_SPELLCAST_START" then
@@ -213,12 +210,20 @@ frame:SetScript("OnEvent", function(self, event, ...)
     elseif event == "UNIT_SPELLCAST_SUCCEEDED" then
         -- Flap only via server ANIM (one shot). SUCCEEDED+ANIM double-fired mid-chain.
         return
+    elseif event == "PLAYER_LEAVING_WORLD" then
+        -- Soft logout/relog: stop Tick/stall/SetBone before unit teardown (crash).
+        if type(WXL_SkyridingSetMode) == "function" then
+            WXL_SkyridingSetMode(0)
+        end
+        active = false
     elseif event == "PLAYER_ENTERING_WORLD" then
-        -- #region agent log
-        Dbg("H13", "enter_world",
-            "flap=" .. tostring(type(WXL_SkyridingFlap)) ..
-            " play=" .. tostring(type(WXL_PlayMountAnim)))
-        -- #endregion
+        -- World reload (login / LFG / taxi): wipe WXL edges then ask server for MODE.
+        if type(WXL_SkyridingSetMode) == "function" then
+            WXL_SkyridingSetMode(0)
+        end
+        if SendAddonMessage then
+            SendAddonMessage(PREFIX, "RESYNC\t1", "WHISPER", UnitName("player"))
+        end
         Refresh()
     end
 end)
@@ -240,7 +245,6 @@ tickDriver:SetScript("OnUpdate", function()
     if type(WXL_SkyridingTick) == "function" then
         WXL_SkyridingTick()
     end
-    -- S = brake signal to server (never hover-stop).
     if active and type(WXL_SkyridingIsBraking) == "function" then
         local brk = WXL_SkyridingIsBraking() or 0
         if brk ~= lastBrk then
@@ -249,9 +253,19 @@ tickDriver:SetScript("OnUpdate", function()
                 SendAddonMessage(PREFIX, "BRK\t" .. tostring(brk), "WHISPER", UnitName("player"))
             end
         end
-    elseif lastBrk ~= 0 then
-        lastBrk = 0
+    end
+    if active and type(WXL_SkyridingConsumeWallImpact) == "function" then
+        if (WXL_SkyridingConsumeWallImpact() or 0) == 1 then
+            if SendAddonMessage then
+                SendAddonMessage(PREFIX, "WALL\t1", "WHISPER", UnitName("player"))
+            end
+        end
+    end
+    if active and type(WXL_SkyridingConsumeLand) == "function" then
+        if (WXL_SkyridingConsumeLand() or 0) == 1 then
+            if SendAddonMessage then
+                SendAddonMessage(PREFIX, "LAND\t1", "WHISPER", UnitName("player"))
+            end
+        end
     end
 end)
-
-Refresh()
